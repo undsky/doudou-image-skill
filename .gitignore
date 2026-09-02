@@ -1,0 +1,13 @@
+# 凭据
+.env
+!.env.example
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 本地产物
+resources/images/*
+!resources/images/.gitkeep
