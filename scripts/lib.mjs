@@ -31,10 +31,18 @@ export class Fail extends Error {
   }
 }
 
-// ---- 配置：命令行 > 环境变量 > <技能目录>/.env ----
-// 只读技能目录那一个 .env，不向上找项目根 —— 换工作目录跑不会读到别的文件。
+/** 查找 .env 配置文件：默认查找技能目录（scripts/ 的上一级），如果没有，那么查找再上一级。 */
+export function findEnvFile() {
+  const primary = join(SKILL_DIR, '.env');
+  if (existsSync(primary)) return primary;
+  const parentEnv = join(resolve(SKILL_DIR, '..'), '.env');
+  if (existsSync(parentEnv)) return parentEnv;
+  return primary;
+}
+
+// ---- 配置：命令行 > 环境变量 > .env ----
 function readDotEnv() {
-  const path = join(SKILL_DIR, '.env');
+  const path = findEnvFile();
   if (!existsSync(path)) return {};
   const out = {};
   for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
