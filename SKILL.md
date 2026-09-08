@@ -156,8 +156,8 @@ node scripts/edit.mjs photo.png '把这块区域画成一盆绿植' --mask mask.
 
 | 配置项 | `.env` 键名 | 命令行 | 必需性 |
 |---|---|---|---|
-| 服务地址 | `DOUDOU_IMAGE_URL` | `--url` | 有兜底默认值 `http://localhost:5678` |
-| 用户标识 | `DOUDOU_IMAGE_KEY` | `--key` / `--uuid` | **必填**，不带直接 400 |
+| 服务地址 | `DOUDOU_API_URL` | `--url` | 有兜底默认值 `http://localhost:5678` |
+| 用户标识 | `DOUDOU_API_KEY` | `--key` / `--uuid` | **必填**，不带直接 400 |
 
 标识填纯 uuid（**不带** `Bearer ` 前缀），在 https://ai.undsky.com/ai/agent 登录后点头像 →
 个人信息获取。脚本会同时发 `X-Uuid` 和 `X-Key` 两个请求头。
@@ -178,7 +178,7 @@ node scripts/generate.mjs --doctor
 
 | `stage` | 含义与处理 |
 |---|---|
-| `auth` | 标识没配、拼错、或账号被停用/软删。跑 `--doctor` 确认；`DOUDOU_IMAGE_KEY` 填纯 uuid |
+| `auth` | 标识没配、拼错、或账号被停用/软删。跑 `--doctor` 确认；`DOUDOU_API_KEY` 填纯 uuid |
 | `validate` | 参数不合法，报错里写了哪一项。prompt 空 / 超长、`n` 越界、`size` 不在白名单 |
 | `download` | `image_url` 下载不下来。要能直连的公网地址，内网地址和需要登录的网盘链接都不行 |
 | `upstream` | 上游没给出有效结果。**最常见的是 `--size` 不是 1024x1024**；其次是带 mask 被拒（该模型不支持 edits）、或上游偶发抖动。脚本会把这几种诱因列出来 |

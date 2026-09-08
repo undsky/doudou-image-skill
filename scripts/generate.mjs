@@ -26,8 +26,8 @@ const HELP = `文生图（经 n8n「生图 API（Base64）」），把结果落�
   --prompt-file <文件> 从文件读描述，长 prompt 用它避免 shell 转义
   --json              输出结构化 JSON（含落盘路径，不含 base64）
   --timeout <秒>      等待上限，默认 ${DEFAULT_TIMEOUT_MS / 1000}
-  --url <地址>        覆盖服务地址（默认读 .env 的 DOUDOU_IMAGE_URL）
-  --key <uuid>        覆盖用户标识（别名 --uuid；更推荐用 DOUDOU_IMAGE_KEY）
+  --url <地址>        覆盖服务地址（默认读 .env 的 DOUDOU_API_URL）
+  --key <uuid>        覆盖用户标识（别名 --uuid；更推荐用 DOUDOU_API_KEY）
   --doctor            自检配置和连通性，不生成任何图片
   -h, --help          显示本帮助
 

@@ -65,15 +65,17 @@ function readDotEnv() {
 
 export function resolveConfig(flags, endpoint) {
   const dotEnv = readDotEnv();
-  const pick = (flagValue, envKey) => {
+  const pick = (flagValue, ...envKeys) => {
     if (flagValue) return { value: flagValue, source: '命令行' };
-    if (process.env[envKey]) return { value: process.env[envKey], source: '环境变量' };
-    if (dotEnv[envKey]) return { value: dotEnv[envKey], source: '.env' };
+    for (const envKey of envKeys) {
+      if (process.env[envKey]) return { value: process.env[envKey], source: `环境变量 $${envKey}` };
+      if (dotEnv[envKey]) return { value: dotEnv[envKey], source: `.env (${envKey})` };
+    }
     return { value: '', source: '' };
   };
 
-  const rawUrl = pick(flags.url, 'DOUDOU_IMAGE_URL');
-  const key = pick(flags.key, 'DOUDOU_IMAGE_KEY');
+  const rawUrl = pick(flags.url, 'DOUDOU_API_URL');
+  const key = pick(flags.key, 'DOUDOU_API_KEY');
   const base = (rawUrl.value || DEFAULT_BASE_URL).trim().replace(/\/+$/, '');
   // 允许 --url 直接给完整端点：省得记该给 base 还是给 endpoint。
   // 注意要按「实际匹配到的那个后缀」去掉，不能按本次要用的 path 的长度 ——
@@ -192,7 +194,7 @@ export async function post(config, body, { timeoutMs, isJson }) {
       throw new Fail(`连不上 ${config.url}`, 'n8n 没在跑？确认容器已启动（docker ps），或用 --url 指向正确的实例');
     }
     if (/ENOTFOUND|EAI_AGAIN/i.test(chain)) {
-      throw new Fail(`域名解析不了：${config.url}`, '检查 DOUDOU_IMAGE_URL 拼写');
+      throw new Fail(`域名解析不了：${config.url}`, '检查 DOUDOU_API_URL 拼写');
     }
     if (/ECONNRESET|EPIPE|UND_ERR_SOCKET/i.test(chain)) {
       throw new Fail(
@@ -237,9 +239,9 @@ export function explain(status, json, config, notesByStage = {}) {
   let hint = json.hint ? String(json.hint) : '';
   if (stage === 'auth') {
     hint = config.key
-      ? `用户标识没通过（来自${config.keySource}）。确认 DOUDOU_IMAGE_KEY 是平台上有效的 uuid，`
+      ? `用户标识没通过（来自${config.keySource}）。确认 DOUDOU_API_KEY 是平台上有效的 uuid，`
         + '值填纯 uuid、不带 Bearer 前缀。账号被停用/软删也会走到这里'
-      : '这个接口必须带用户标识。设置 DOUDOU_IMAGE_KEY 或写进 <技能目录>/.env，也可以本次用 --key <uuid> 传';
+      : '这个接口必须带用户标识。设置 DOUDOU_API_KEY 或写进 <技能目录>/.env，也可以本次用 --key <uuid> 传';
   } else if (stage === 'upstream') {
     // 上游只回一个不带信息的裸 400，接口再包一层就成了「暂时不可用」——
     // 光看这句话没法分辨是该重试还是该改参数，所以把已知的诱因列出来。
@@ -474,7 +476,7 @@ export function requireKey(config) {
   if (config.key) return;
   throw new Fail(
     '没有配置用户标识',
-    '这两个接口都必须带标识（不带直接 400）。设置环境变量 DOUDOU_IMAGE_KEY，'
+    '这两个接口都必须带标识（不带直接 400）。设置环境变量 DOUDOU_API_KEY，'
       + '或写进 <技能目录>/.env，也可以本次用 --key <uuid> 传。可在平台个人信息获取',
   );
 }
@@ -492,7 +494,7 @@ export async function doctor(flags) {
   lines.push(
     generate.key
       ? `用户标识 已配置（来自${generate.keySource}，${generate.key.length} 字符）`
-      : '用户标识 未配置 ✗ — 必填。设置 DOUDOU_IMAGE_KEY 或写进 <技能目录>/.env',
+      : '用户标识 未配置 ✗ — 必填。设置 DOUDOU_API_KEY 或写进 <技能目录>/.env',
   );
 
   if (generate.key && major >= 18) {
