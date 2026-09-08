@@ -31,12 +31,16 @@ export class Fail extends Error {
   }
 }
 
-/** 查找 .env 配置文件：默认查找技能目录（scripts/ 的上一级），如果没有，那么查找再上一级。 */
+/** 查找 .env 配置文件：默认查找技能目录（scripts/ 的上一级），如果没有，依次向上查找（最多向上找 3 级）。 */
 export function findEnvFile() {
   const primary = join(SKILL_DIR, '.env');
   if (existsSync(primary)) return primary;
-  const parentEnv = join(resolve(SKILL_DIR, '..'), '.env');
-  if (existsSync(parentEnv)) return parentEnv;
+  let curr = SKILL_DIR;
+  for (let i = 0; i < 3; i++) {
+    curr = resolve(curr, '..');
+    const candidate = join(curr, '.env');
+    if (existsSync(candidate)) return candidate;
+  }
   return primary;
 }
 
