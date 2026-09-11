@@ -9,6 +9,8 @@ Thumbs.db
 .idea/
 
 # 本地产物
-resources/images/*
-!resources/images/.gitkeep
+# resources/images 是默认落盘位置（拼在调用方项目根下，见 lib.mjs 的 findProjectRoot）。
+# 仓库里不预留这个目录 —— 脚本落盘前会自己 mkdir。这条规则只为了兜住
+# "恰好在本仓库内跑脚本"时生成的图片，别让它们进版本库。
+resources/
 scratch/

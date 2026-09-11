@@ -6,8 +6,8 @@
 import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import {
-  EDIT_SIZES, Fail, checkMask, checkPrompt, doctor, explain, fetchRemoteImage,
-  humanBytes, info, normalizeSize, parseArgs, parseCount, parseImageData, parseTimeout, post,
+  Fail, KNOWN_GOOD_SIZE, checkMask, checkPrompt, doctor, explain, fetchRemoteImage,
+  humanBytes, info, parseArgs, parseCount, parseImageData, parseSizeArg, parseTimeout, post,
   readImageFile, requireKey, resolveConfig, resolveModel, run, safeStem, saveImages,
 } from './lib.mjs';
 
@@ -26,7 +26,7 @@ const HELP = `图像编辑 / 修图（对接 New API / OpenAI 原生图像编辑
 选项：
   --mask <PNG>        只重画 mask 的透明区域。必须是带 alpha 的 PNG，尺寸和原图完全一致
   -n <1-10>           生成几张（默认 1）
-  --size <尺寸>       图像分辨率：支持 1K、2K、4K 或具体像素如 1024x1024（默认 1024x1024）
+  --size <尺寸>       1K / 2K / 4K 或具体像素。默认不下发，保持原图比例（推荐）
   -o, --output <路径> 保存位置：具体文件名、目录（以 / 结尾），或省略走 <项目根>/resources/images/
   --model <名字>      指定模型（若配置了多个模型且未传此项，将提示选择）
   --models            列出当前配置的所有可用模型
@@ -37,9 +37,11 @@ const HELP = `图像编辑 / 修图（对接 New API / OpenAI 原生图像编辑
   --key <token>       覆盖访问凭证（默认读 .env 的 IMAGE_API_KEY）
   --doctor            自检配置和连通性，不编辑任何图片
   -h, --help          显示本帮助
+  --                  之后的内容一律当描述（描述以 - 开头时用它）
 
 说明：
   提示词上限 1000 字。待编辑图和 mask 各自不超过 4MB。
+  --size 别乱动：实测只有 ${KNOWN_GOOD_SIZE} 可用，且传了会把非方图拉成方的。不传即保持原图比例。
   当配置了多个模型时，未指定 --model 将提示用户选择；若只配置了单个模型则直接使用。
   mask 的透明区域 = 要重画的部分，不透明的部分保持原样。带 mask 时原图必须是 PNG。`;
 
@@ -103,14 +105,8 @@ async function main() {
   const n = parseCount(flags.count, 'edit');
   const timeoutMs = parseTimeout(flags.timeout, DEFAULT_TIMEOUT_MS);
 
-  const rawSize = flags.size ? String(flags.size).trim() : '1024x1024';
-  const size = normalizeSize(rawSize);
-  if (!EDIT_SIZES.includes(size)) {
-    throw new Fail(`--size 只认 1K / 2K / 4K 或 ${EDIT_SIZES.join(' / ')}，收到：${rawSize}`);
-  }
-  if (size !== '1024x1024') {
-    info(`注意：部分模型对 ${size} 支持不佳可能报错，推荐使用 1024x1024`);
-  }
+  // 不传 --size 就不下发这个字段：以前无条件发 1024x1024，非方图（如 1448x1086）会被拉变形
+  const size = parseSizeArg(flags.size, 'edit');
 
   requireKey(config);
   const model = await resolveModel(flags, config.modelList);
@@ -123,7 +119,7 @@ async function main() {
   }
 
   const where = remote ? target : `${target}（${humanBytes(image.bytes)}, ${image.mime}）`;
-  info(`编辑中：${where}${mask ? ` + mask ${basename(mask.path)}` : ''}，${n} 张 ${size}，模型 ${model}`);
+  info(`编辑中：${where}${mask ? ` + mask ${basename(mask.path)}` : ''}，${n} 张 ${size || '保持原尺寸'}，模型 ${model}`);
 
   const form = new FormData();
   form.append('image', new Blob([image.buffer], { type: image.mime }), image.filename || 'image.png');
@@ -133,7 +129,7 @@ async function main() {
   form.append('prompt', prompt);
   form.append('model', model);
   form.append('n', String(n));
-  form.append('size', size);
+  if (size) form.append('size', size);
 
   const startedAt = Date.now();
   const { status, json } = await post(config, form, { timeoutMs, isJson: false });
@@ -141,10 +137,11 @@ async function main() {
 
   if (status !== 200 || !json || !Array.isArray(json.data)) {
     const suggestions = [];
-    if (size !== '1024x1024') suggestions.push(`尺寸 ${size} 可能不被模型支持，改用默认的 1024x1024 重试`);
+    if (size && size !== KNOWN_GOOD_SIZE) suggestions.push(`尺寸 ${size} 可能不被模型支持，去掉 --size 或改用 ${KNOWN_GOOD_SIZE} 重试`);
     if (mask) suggestions.push('部分模型不支持带 mask 编辑，可尝试去掉 --mask');
+    if (image.mime !== 'image/png') suggestions.push(`接口文档要求待编辑图是 PNG，当前是 ${image.mime}，可先转成 PNG 再试`);
     suggestions.push(`确认所选模型 [${model}] 是否支持图像编辑`);
-    throw explain(status, json, config, { suggestions });
+    throw explain(status, json, config, { model, suggestions });
   }
 
   const images = await Promise.all(json.data.map(parseImageData));
@@ -159,7 +156,7 @@ async function main() {
       success: true,
       model,
       prompt,
-      size,
+      size: size || null,
       has_mask: !!mask,
       count: saved.length,
       seconds: Number(seconds),
