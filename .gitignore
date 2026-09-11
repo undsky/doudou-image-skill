@@ -11,3 +11,4 @@ Thumbs.db
 # 本地产物
 resources/images/*
 !resources/images/.gitkeep
+scratch/

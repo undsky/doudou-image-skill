@@ -1,24 +1,38 @@
 // doudou-image-skill 共用工具：配置、HTTP、错误翻译、产物落盘、PNG 头解析。
-// generate.mjs 和 edit.mjs 都从这里取，两个入口的行为才一致。
+// generate.mjs 和 edit.mjs 均从这里引用，直接对接 New API / 原生 OpenAI 图像接口。
 //
 // 为什么是 Node 脚本而不是直接 curl：Windows PowerShell 5.1 里 `curl` 是
 // Invoke-WebRequest 的别名，不认 -F，编辑接口的 multipart 上传直接失败；
-// 而两个接口都返回裸 base64（单张 1024px 的 PNG 约 2MB），必须落盘成文件，
-// 不能让它进终端或上下文。Node 18+ 自带 fetch / FormData / Blob，无第三方依赖。
+// 脚本内置支持 base64 与 URL 下载，自动落盘成文件，不进终端或上下文。
+// Node 18+ 自带 fetch / FormData / Blob，无任何第三方依赖。
 
 import { stat, mkdir, writeFile } from 'node:fs/promises';
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { dirname, extname, join, resolve } from 'node:path';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createInterface } from 'node:readline/promises';
 
 export const SKILL_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-// 默认本机实例：公网 n8n.undsky.com 是另一台，上面没有这两条工作流（打过去 404）
-export const DEFAULT_BASE_URL = 'http://localhost:5678';
-export const ENDPOINTS = { generate: '/webhook/image-generate', edit: '/webhook/image-edit' };
-// 编辑接口对图和 mask 各自的上限，跟工作流「统一图片为 Base64」里一致。
-// 本地先拦一遍：超了上游只回一个不带信息的裸 400，等整个文件传完才报错白等一趟。
+export const DEFAULT_BASE_URL = 'https://qkmss.com';
+export const DEFAULT_MODEL = 'gpt-image-2';
+export const ENDPOINTS = { generate: '/v1/images/generations', edit: '/v1/images/edits' };
 export const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
-export const EDIT_SIZES = ['256x256', '512x512', '1024x1024'];
+export const EDIT_SIZES = ['256x256', '512x512', '1024x1024', '2048x2048', '4096x4096'];
+export const RESOLUTION_MAP = {
+  '1k': '1024x1024',
+  '1K': '1024x1024',
+  '2k': '2048x2048',
+  '2K': '2048x2048',
+  '4k': '4096x4096',
+  '4K': '4096x4096',
+};
+
+export function normalizeSize(rawSize) {
+  if (!rawSize) return undefined;
+  const s = String(rawSize).trim();
+  return RESOLUTION_MAP[s] || s;
+}
+
 export const PROMPT_MAX = { generate: 8000, edit: 1000 };
 export const N_MAX = { generate: 4, edit: 10 };
 const ROOT_MARKERS = ['.agents', '.claude', '.git'];
@@ -63,6 +77,19 @@ function readDotEnv() {
   return out;
 }
 
+/** 智能拼接完整的端点 URL，兼容携带 /v1、已是完整端点或包含尾斜杠的情况 */
+export function buildEndpointUrl(rawUrl, endpoint) {
+  let base = (rawUrl || DEFAULT_BASE_URL).trim().replace(/\/+$/, '');
+  const path = ENDPOINTS[endpoint];
+  if (base.toLowerCase().endsWith(path.toLowerCase())) {
+    return base;
+  }
+  if (base.toLowerCase().endsWith('/v1')) {
+    return `${base}${path.slice(3)}`;
+  }
+  return `${base}${path}`;
+}
+
 export function resolveConfig(flags, endpoint) {
   const dotEnv = readDotEnv();
   const pick = (flagValue, ...envKeys) => {
@@ -74,22 +101,73 @@ export function resolveConfig(flags, endpoint) {
     return { value: '', source: '' };
   };
 
-  const rawUrl = pick(flags.url, 'DOUDOU_API_URL');
-  const key = pick(flags.key, 'DOUDOU_API_KEY');
-  const base = (rawUrl.value || DEFAULT_BASE_URL).trim().replace(/\/+$/, '');
-  // 允许 --url 直接给完整端点：省得记该给 base 还是给 endpoint。
-  // 注意要按「实际匹配到的那个后缀」去掉，不能按本次要用的 path 的长度 ——
-  // 两个端点路径不一样长，给了 image-edit 却在跑 generate 时会切歪。
-  const path = ENDPOINTS[endpoint];
-  const matched = Object.values(ENDPOINTS).find((p) => base.toLowerCase().endsWith(p)) || '';
-  const baseUrl = matched ? base.slice(0, base.length - matched.length) : base;
+  const rawUrl = pick(flags.url, 'IMAGE_API_URL', 'DOUDOU_IMAGE_API_URL', 'DOUDOU_API_URL', 'OPENAI_BASE_URL');
+  const key = pick(flags.key, 'IMAGE_API_KEY', 'DOUDOU_IMAGE_API_KEY', 'DOUDOU_API_KEY', 'OPENAI_API_KEY');
+  const models = pick(flags.models, 'IMAGE_API_MODELS', 'IMAGE_API_MODEL', 'DOUDOU_IMAGE_MODELS', 'DOUDOU_IMAGE_MODEL', 'IMAGE_MODEL');
+
+  const baseUrl = (rawUrl.value || DEFAULT_BASE_URL).trim().replace(/\/+$/, '');
+  const url = buildEndpointUrl(baseUrl, endpoint);
+  const modelList = (models.value || DEFAULT_MODEL)
+    .split(/[,，\s]+/)
+    .map((m) => m.trim())
+    .filter(Boolean);
+
   return {
     baseUrl,
-    url: `${baseUrl}${path}`,
+    url,
     urlSource: rawUrl.value ? rawUrl.source : '默认值',
     key: key.value.trim(),
     keySource: key.source,
+    modelList: modelList.length ? modelList : [DEFAULT_MODEL],
+    modelsSource: models.value ? models.source : '默认值',
+    defaultModel: modelList[0] || DEFAULT_MODEL,
   };
+}
+
+/**
+ * 确定本次请求实际使用的模型：
+ * 1. 若命令行显式传了 --model，直接使用；
+ * 2. 若仅配置了 1 个模型，直接使用（无需询问用户）；
+ * 3. 若配置了多个模型且未指定：
+ *    - 交互式终端 (TTY)：提供编号交互选择；
+ *    - 非交互终端（如 AI/脚本）：抛出 Fail 错误，列出所有可选模型，要求指定 --model。
+ */
+export async function resolveModel(flags, modelList) {
+  if (flags.model) {
+    return String(flags.model).trim();
+  }
+  if (!modelList || modelList.length === 0) {
+    return DEFAULT_MODEL;
+  }
+  if (modelList.length === 1) {
+    return modelList[0];
+  }
+
+  // 交互式终端 (TTY) 提示选择
+  if (process.stdin.isTTY) {
+    info(`当前配置了 ${modelList.length} 个可用模型，请选择（直接回车默认第 1 项）：`);
+    for (let i = 0; i < modelList.length; i++) {
+      info(`  ${i + 1}) ${modelList[i]}`);
+    }
+    const rl = createInterface({ input: process.stdin, output: process.stderr });
+    try {
+      const answer = (await rl.question(`请输入模型序号 (1-${modelList.length}) [1]: `)).trim();
+      const idx = answer ? parseInt(answer, 10) - 1 : 0;
+      if (Number.isInteger(idx) && idx >= 0 && idx < modelList.length) {
+        return modelList[idx];
+      }
+      info(`输入不合法，已使用默认模型：${modelList[0]}`);
+      return modelList[0];
+    } finally {
+      rl.close();
+    }
+  }
+
+  // 非交互终端：列出选项报错
+  throw new Fail(
+    `未指定使用哪个模型。当前配置了 ${modelList.length} 个可用模型：${modelList.join('、')}`,
+    `请向用户确认后，使用 --model <名字> 显式指定。\n可选模型：\n${modelList.map((m, i) => `  ${i + 1}. ${m}`).join('\n')}`,
+  );
 }
 
 // ---- 展示辅助 ----
@@ -146,8 +224,6 @@ export function findProjectRoot() {
 }
 
 // ---- HTTP ----
-// fetch 失败时 message 一律是干巴巴的 "fetch failed"，真正的 errno 埋在 cause 里，
-// 而且 localhost 会同时试 IPv6 和 IPv4，失败时 cause 是个 AggregateError —— 得连 errors[] 一起翻。
 function causeChain(error) {
   const codes = [];
   const visit = (node, depth) => {
@@ -162,13 +238,13 @@ function causeChain(error) {
   return codes.join(' ');
 }
 
-/** POST 到 webhook，返回 { status, json }。网络层失败翻译成能照着修的提示。 */
+/** POST 到上游 API，返回 { status, json }。网络层失败翻译成可指导修复的提示。 */
 export async function post(config, body, { timeoutMs, isJson }) {
-  const headers = {};
+  const headers = {
+    Accept: '*/*',
+  };
   if (config.key) {
-    // 两个头都发：工作流按 X-Uuid > uuid > X-Key > key 取第一个非空的
-    headers['X-Uuid'] = config.key;
-    headers['X-Key'] = config.key;
+    headers['Authorization'] = config.key.startsWith('Bearer ') ? config.key : `Bearer ${config.key}`;
   }
   if (isJson) headers['Content-Type'] = 'application/json';
 
@@ -187,19 +263,19 @@ export async function post(config, body, { timeoutMs, isJson }) {
     if (/TimeoutError|AbortError|HeadersTimeoutError|BodyTimeoutError/i.test(chain)) {
       throw new Fail(
         `等了 ${Math.round(timeoutMs / 1000)} 秒没等到响应`,
-        '实测文生图 15-25 秒、修图 20-70 秒、带 mask 约 180 秒。用 --timeout 加长，或去掉 --mask',
+        '实测生图约 15-40 秒、修图 20-70 秒。可用 --timeout 加长等待时间',
       );
     }
     if (/ECONNREFUSED/i.test(chain)) {
-      throw new Fail(`连不上 ${config.url}`, 'n8n 没在跑？确认容器已启动（docker ps），或用 --url 指向正确的实例');
+      throw new Fail(`连不上接口地址：${config.url}`, '检查服务地址是否拼写正确，或网络是否通畅');
     }
     if (/ENOTFOUND|EAI_AGAIN/i.test(chain)) {
-      throw new Fail(`域名解析不了：${config.url}`, '检查 DOUDOU_API_URL 拼写');
+      throw new Fail(`域名解析不了：${config.url}`, '检查 IMAGE_API_URL 拼写');
     }
     if (/ECONNRESET|EPIPE|UND_ERR_SOCKET/i.test(chain)) {
       throw new Fail(
         `连接被断开：${config.url}`,
-        '请求体太大时 n8n 会读到上限后直接断开而不回响应。编辑接口的图请控制在 4MB 内',
+        '可能请求体过大或上游网关切断连接。请控制图片在 4MB 以内',
       );
     }
     throw new Fail(`请求失败：${chain}`);
@@ -209,65 +285,104 @@ export async function post(config, body, { timeoutMs, isJson }) {
   try {
     json = JSON.parse(text);
   } catch {
-    /* 非 JSON 响应（网关错误页之类）留给下面按状态码兜底 */
+    /* 非 JSON 响应（网关 502/504 错误页之类）留给下面按状态码处理 */
   }
   if (!json) {
-    if (response.status === 404) throw notActive(config);
+    if (response.status === 404) {
+      throw new Fail(
+        `端点不存在（404）：${config.url}`,
+        '请检查服务地址 IMAGE_API_URL 是否配置正确（是否包含正确的 Base URL）',
+      );
+    }
     throw new Fail(`响应不是 JSON（HTTP ${response.status}）`, text.slice(0, 300));
   }
   return { status: response.status, json };
 }
 
-function notActive(config) {
-  return new Fail(
-    `端点不存在（404）：${config.url}`,
-    '两种可能：工作流「生图 API（Base64）」没激活；或 --url 指到了另一个 n8n 实例'
-      + `（公网 n8n.undsky.com 上没有这两条工作流，本机默认是 ${DEFAULT_BASE_URL}）`,
-  );
-}
+// 错误翻译：按 New API / OpenAI 接口规范与 HTTP 状态码解释错误
+export function explain(status, json, config, notes = {}) {
+  const errorObj = json?.error;
+  let message = '未知错误';
+  let code = '';
+  let type = '';
 
-// 接口的报错够具体（message + stage + hint），但 auth / upstream 这两类失败
-// 光看响应体猜不到该动哪里 —— 这里按 stage 补上「去改什么」。
-export function explain(status, json, config, notesByStage = {}) {
-  const stage = String(json.stage || '');
-  const error = json.error || {};
-  const message = String(error.message || json.error || '未知错误');
-  const detail = json.detail ? String(json.detail).slice(0, 300) : '';
-  const parts = [`接口返回失败（HTTP ${status}，stage=${stage || '?'}）：${message}`];
-  if (detail) parts.push(`详情：${detail}`);
-
-  let hint = json.hint ? String(json.hint) : '';
-  if (stage === 'auth') {
-    hint = config.key
-      ? `用户标识没通过（来自${config.keySource}）。确认 DOUDOU_API_KEY 是平台上有效的 uuid，`
-        + '值填纯 uuid、不带 Bearer 前缀。账号被停用/软删也会走到这里'
-      : '这个接口必须带用户标识。设置 DOUDOU_API_KEY 或写进 <技能目录>/.env，也可以本次用 --key <uuid> 传';
-  } else if (stage === 'upstream') {
-    // 上游只回一个不带信息的裸 400，接口再包一层就成了「暂时不可用」——
-    // 光看这句话没法分辨是该重试还是该改参数，所以把已知的诱因列出来。
-    hint = [
-      '上游这次没给出有效结果。已知诱因（按可能性）：',
-      ...(notesByStage.upstream || []).map((note) => `  · ${note}`),
-      '  · 上游偶发抖动 —— 以上都排除了就原样重试一次',
-    ].join('\n');
-  } else if (stage === 'subworkflow') {
-    // 接口把子工作流的原话（含 model=X 和可用模型列表）压成了一句笼统的
-    // 「配置不可用」，所以「是不是我 --model 传错了」得由调用方自己补上。
-    hint = [
-      ...(notesByStage.subworkflow || []).map((note) => `  · ${note}`),
-      '  · 服务端配置问题：数据表「生图 API 配置」里没有 enabled = 1 的记录，'
-        + '或选中的那条缺 url / authorizationToken —— 这个只能改数据表',
-    ].join('\n');
-    hint = `配置没匹配上。可能是：\n${hint}`;
-  } else if (status === 404) {
-    return notActive(config);
+  if (typeof errorObj === 'string') {
+    message = errorObj;
+  } else if (errorObj && typeof errorObj === 'object') {
+    message = errorObj.message || json?.message || json?.detail || '未知错误';
+    code = errorObj.code || '';
+    type = errorObj.type || '';
+  } else if (json?.message) {
+    message = json.message;
   }
+
+  const parts = [`接口返回失败（HTTP ${status}${code ? `，code=${code}` : ''}${type ? `，type=${type}` : ''}）：${message}`];
+
+  let hint = '';
+  if (status === 401 || status === 403) {
+    hint = config.key
+      ? `API Key 认证未通过（来自${config.keySource}）。请检查 IMAGE_API_KEY 是否正确有效、额度是否充足。`
+      : '未配置 API Key。请在 <技能目录>/.env 中配置 IMAGE_API_KEY，或在命令行使用 --key <token>。';
+  } else if (status === 404) {
+    hint = `端点不存在（404）：${config.url}。请检查服务地址 IMAGE_API_URL 是否正确。`;
+  } else if (status === 429) {
+    hint = '请求受限（429）：API 速率超限或账户额度已耗尽，请稍后再试或检查账户余额。';
+  } else if (status >= 500) {
+    hint = '上游服务暂时不可用（5xx），可能是上游服务器抖动，请稍后重试。';
+  } else {
+    // 400 Bad Request 等
+    const suggestions = [];
+    if (notes.suggestions && Array.isArray(notes.suggestions)) {
+      suggestions.push(...notes.suggestions);
+    }
+    if (suggestions.length) {
+      hint = `建议排查：\n${suggestions.map((s) => `  · ${s}`).join('\n')}`;
+    }
+  }
+
   return new Fail(parts.join('\n'), hint);
 }
 
+/** 解析上游返回的单条图片数据（兼容 b64_json 与 url 两种形态） */
+export async function parseImageData(item) {
+  if (!item || typeof item !== 'object') {
+    throw new Fail('上游返回的图片项格式非法', JSON.stringify(item).slice(0, 200));
+  }
+  if (item.b64_json) {
+    const buffer = Buffer.from(item.b64_json, 'base64');
+    const mime = sniffMime(buffer) || 'image/png';
+    return {
+      buffer,
+      mime_type: mime,
+      b64_json: item.b64_json,
+      bytes: buffer.length,
+    };
+  }
+  if (item.url) {
+    let resp;
+    try {
+      resp = await fetch(item.url, { signal: AbortSignal.timeout(60000) });
+    } catch (e) {
+      throw new Fail(`下载上游生成的图片失败：${item.url}`, e.message);
+    }
+    if (!resp.ok) {
+      throw new Fail(`下载上游图片返回 HTTP ${resp.status}：${item.url}`);
+    }
+    const arrayBuffer = await resp.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    const mime = sniffMime(buffer) || 'image/png';
+    return {
+      buffer,
+      mime_type: mime,
+      b64_json: buffer.toString('base64'),
+      bytes: buffer.length,
+      sourceUrl: item.url,
+    };
+  }
+  throw new Fail('上游数据项中既没有 b64_json 也没有 url', JSON.stringify(item).slice(0, 200));
+}
+
 // ---- 产物落盘 ----
-// 接口返回的 mime_type 是工作流按魔数嗅出来的（上游声明的常常是错的），
-// 所以扩展名跟着它走，而不是跟着 prompt 或用户给的名字猜。
 function targetPaths(images, flags, stem) {
   const ext = (i) => EXT_OF[images[i].mime_type] || '.png';
   const out = String(flags.output || '');
@@ -287,26 +402,25 @@ function targetPaths(images, flags, stem) {
   }
   // 单文件：原样用用户给的路径（扩展名不改，只在对不上时警告）
   if (images.length === 1) return [resolve(out)];
-  // 多张但给了具体文件名：在扩展名前插序号，别互相覆盖
+  // 多张但给了具体文件名：在扩展名前插序号，避免互相覆盖
   const base = resolve(out);
   const suffix = extname(base);
   const head = suffix ? base.slice(0, -suffix.length) : base;
   return images.map((_, i) => `${head}-${i + 1}${suffix || ext(i)}`);
 }
 
-/** 把 images[].b64_json 写成文件，返回落盘后的绝对路径数组。 */
+/** 把图片写成文件，返回落盘后的绝对路径数组。 */
 export async function saveImages(images, flags, stem) {
   const paths = targetPaths(images, flags, stem);
   const saved = [];
   for (const [i, image] of images.entries()) {
     const path = paths[i];
     await mkdir(dirname(path), { recursive: true });
-    const buffer = Buffer.from(image.b64_json, 'base64');
+    const buffer = image.buffer || Buffer.from(image.b64_json, 'base64');
     await writeFile(path, buffer);
     const want = EXT_OF[image.mime_type] || '.png';
     if (extname(path).toLowerCase() !== want) {
-      // 不替用户改路径：脚本和后续命令可能就按这个名字接着走
-      info(`注意：${path} 的扩展名和实际格式（${image.mime_type}）对不上，内容是按 ${want} 写的`);
+      info(`注意：${path} 的扩展名和实际格式（${image.mime_type}）对不上，内容已按 ${want} 写入`);
     }
     saved.push({ path, mime_type: image.mime_type, bytes: buffer.length });
   }
@@ -314,7 +428,6 @@ export async function saveImages(images, flags, stem) {
 }
 
 // ---- 图片与 mask 本地预检 ----
-// 按魔数认真实格式：文件名后缀经常是错的，而 mask 的规则只对 PNG 成立。
 export function sniffMime(buffer) {
   const head = buffer;
   if (head.length >= 8 && head.readUInt32BE(0) === 0x89504e47 && head.readUInt32BE(4) === 0x0d0a1a0a) return 'image/png';
@@ -335,7 +448,6 @@ export function readPngInfo(buffer) {
     colorType: buffer[25],
     hasTrns: false,
   };
-  // tRNS 必须出现在 IDAT 之前，所以扫到 IDAT 就可以停
   let off = 8;
   while (off + 8 <= buffer.length) {
     const len = buffer.readUInt32BE(off);
@@ -348,7 +460,6 @@ export function readPngInfo(buffer) {
   return info;
 }
 
-// colorType 4=灰度+alpha、6=RGBA；3=调色板（靠 tRNS 带透明）
 const hasAlpha = (info) => info.colorType === 4 || info.colorType === 6 || (info.colorType === 3 && info.hasTrns);
 
 /** 读本地图片文件并做体积/格式检查。label 用于报错文案。 */
@@ -370,15 +481,46 @@ export async function readImageFile(path, label) {
   const buffer = readFileSync(path);
   const mime = sniffMime(buffer);
   if (!mime) {
-    throw new Fail(`${label}不像是图片：${path}`, '按魔数认不出 PNG / JPEG / WebP / GIF，确认文件没坏');
+    throw new Fail(`${label}不像是图片：${path}`, '按魔数认不出 PNG / JPEG / WebP / GIF，确认文件未损坏');
   }
-  return { path, buffer, mime, bytes: buffer.length };
+  return { path, buffer, mime, bytes: buffer.length, filename: basename(path) };
+}
+
+/** 从远程 URL 下载待编辑图片并校验 */
+export async function fetchRemoteImage(url) {
+  let resp;
+  try {
+    resp = await fetch(url, { signal: AbortSignal.timeout(60000) });
+  } catch (e) {
+    throw new Fail(`下载待编辑的图片失败：${url}`, e.message);
+  }
+  if (!resp.ok) {
+    throw new Fail(`下载待编辑的图片返回 HTTP ${resp.status}：${url}`);
+  }
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  if (buffer.length === 0) {
+    throw new Fail(`下载的文件是空内容：${url}`);
+  }
+  if (buffer.length > MAX_IMAGE_BYTES) {
+    throw new Fail(
+      `待编辑图片 ${humanBytes(buffer.length)}，超过 ${humanBytes(MAX_IMAGE_BYTES)} 上限`,
+      '请先缩小再传，或使用本地小尺寸图片',
+    );
+  }
+  const mime = sniffMime(buffer);
+  if (!mime) {
+    throw new Fail(`下载的文件不像是图片：${url}`, '按魔数认不出 PNG / JPEG / WebP / GIF');
+  }
+  let filename = 'remote-image.png';
+  try {
+    const u = new URL(url);
+    filename = basename(u.pathname) || 'remote-image.png';
+  } catch { /* ignore */ }
+  return { path: url, buffer, mime, bytes: buffer.length, filename };
 }
 
 /**
  * mask 的三条规则本地先查：必须是带 alpha 的 PNG、尺寸和原图一致、原图也得是 PNG。
- * 上游对这三条都只回一个不带信息的裸 400，不自己查根本没法定位。
- * image 为 null（走 image_url）时跳过尺寸比对 —— 那时原图还没下载下来。
  */
 export function checkMask(mask, image) {
   const maskInfo = readPngInfo(mask.buffer);
@@ -391,26 +533,24 @@ export function checkMask(mask, image) {
       `透明区域 = 要重画的部分。当前 PNG colorType=${maskInfo.colorType}（需要 4/6，或带 tRNS 的 3），导出时选 RGBA`,
     );
   }
-  if (!image) return { checkedSize: false, width: maskInfo.width, height: maskInfo.height };
-  if (image.mime !== 'image/png') {
-    throw new Fail('带 mask 时待编辑图必须是 PNG', `当前待编辑图是 ${image.mime}，先转成 PNG`);
+  if (image) {
+    if (image.mime !== 'image/png') {
+      throw new Fail('带 mask 时待编辑图必须是 PNG', `当前待编辑图是 ${image.mime}，先转成 PNG`);
+    }
+    const imgInfo = readPngInfo(image.buffer);
+    if (!imgInfo) throw new Fail('待编辑图的 PNG 头读不出来', `确认 ${image.path} 是完整的 PNG`);
+    if (imgInfo.width !== maskInfo.width || imgInfo.height !== maskInfo.height) {
+      throw new Fail(
+        `mask 尺寸必须和原图一致：原图 ${imgInfo.width}x${imgInfo.height}，mask ${maskInfo.width}x${maskInfo.height}`,
+        '按原图尺寸重做 mask，例如 magick mask.png -resize ' + `${imgInfo.width}x${imgInfo.height}! mask-fixed.png`,
+      );
+    }
+    return { checkedSize: true, width: imgInfo.width, height: imgInfo.height };
   }
-  const imgInfo = readPngInfo(image.buffer);
-  if (!imgInfo) throw new Fail('待编辑图的 PNG 头读不出来', `确认 ${image.path} 是完整的 PNG`);
-  if (imgInfo.width !== maskInfo.width || imgInfo.height !== maskInfo.height) {
-    throw new Fail(
-      `mask 尺寸必须和原图一致：原图 ${imgInfo.width}x${imgInfo.height}，mask ${maskInfo.width}x${maskInfo.height}`,
-      '按原图尺寸重做 mask，例如 magick mask.png -resize ' + `${imgInfo.width}x${imgInfo.height}! mask-fixed.png`,
-    );
-  }
-  return { checkedSize: true, width: imgInfo.width, height: imgInfo.height };
+  return { checkedSize: false, width: maskInfo.width, height: maskInfo.height };
 }
 
 // ---- 参数解析 ----
-/**
- * spec.value: 需要跟值的选项 -> 目标键名；spec.bool: 布尔开关 -> 目标键名。
- * `--` 之后的一律当位置参数，prompt 以 - 开头时用得上。
- */
 export function parseArgs(argv, spec) {
   const flags = { positional: [] };
   let onlyPositional = false;
@@ -434,7 +574,6 @@ export function parseArgs(argv, spec) {
   return flags;
 }
 
-/** 校验 n：两个接口上限不同（生成 4、编辑 10）。 */
 export function parseCount(raw, endpoint) {
   if (raw === undefined) return 1;
   const max = N_MAX[endpoint];
@@ -475,43 +614,70 @@ export function checkPrompt(prompt, endpoint) {
 export function requireKey(config) {
   if (config.key) return;
   throw new Fail(
-    '没有配置用户标识',
-    '这两个接口都必须带标识（不带直接 400）。设置环境变量 DOUDOU_API_KEY，'
-      + '或写进 <技能目录>/.env，也可以本次用 --key <uuid> 传。可在平台个人信息获取',
+    '未配置 API 访问凭证（Key）',
+    '设置环境变量 IMAGE_API_KEY，或写进 <技能目录>/.env，也可以在本次命令行使用 --key <token> 传递。',
   );
 }
 
 // ---- doctor：配置和连通性自检 ----
-// 故意发一个不带 prompt 的空请求：接口会回 400 stage=validate，
-// 这恰好证明「URL 对、标识有效、工作流活着」，又不会真去生成图片、烧额度。
+// 通过 GET /v1/models 探测服务连通性与 Key 有效性，不消耗生图额度
 export async function doctor(flags) {
   const lines = [];
   const major = Number(process.versions.node.split('.')[0]);
   lines.push(`Node ${process.versions.node} ${major >= 18 ? '✓' : '✗ 需要 18+（fetch / FormData / Blob）'}`);
 
-  const generate = resolveConfig(flags, 'generate');
-  lines.push(`服务地址 ${generate.baseUrl}（来自${generate.urlSource}）`);
+  const config = resolveConfig(flags, 'generate');
+  lines.push(`服务 Base URL: ${config.baseUrl}（来自${config.urlSource}）`);
   lines.push(
-    generate.key
-      ? `用户标识 已配置（来自${generate.keySource}，${generate.key.length} 字符）`
-      : '用户标识 未配置 ✗ — 必填。设置 DOUDOU_API_KEY 或写进 <技能目录>/.env',
+    config.key
+      ? `API Key: 已配置（来自${config.keySource}，前 7 位: ${config.key.slice(0, 7)}...）`
+      : 'API Key: 未配置 ✗ — 必填。设置 IMAGE_API_KEY 或写进 <技能目录>/.env',
   );
+  lines.push(`配置模型: ${config.modelList.join('、')} (${config.modelList.length} 个，来自${config.modelsSource})`);
+  if (config.modelList.length === 1) {
+    lines.push(`模型策略: 单模型模式（未指定时直接使用 ${config.modelList[0]}，无需询问用户）`);
+  } else {
+    lines.push(`模型策略: 多模型模式（未指定时将列出供用户选择；或通过 --model 显式指定）`);
+  }
 
-  if (generate.key && major >= 18) {
-    for (const endpoint of ['generate', 'edit']) {
-      const config = resolveConfig(flags, endpoint);
-      try {
-        const { status, json } = await post(config, '{}', { timeoutMs: 20000, isJson: true });
-        if (json.stage === 'validate') {
-          lines.push(`${ENDPOINTS[endpoint]} ✓（可达、标识通过、工作流已激活）`);
-        } else if (json.stage === 'auth') {
-          lines.push(`${ENDPOINTS[endpoint]} ✗ 标识没通过：${json.error?.message || ''}`);
-        } else {
-          lines.push(`${ENDPOINTS[endpoint]} ? 意外响应（HTTP ${status}）：${JSON.stringify(json).slice(0, 160)}`);
+  if (config.key && major >= 18) {
+    let modelsUrl = config.baseUrl;
+    if (modelsUrl.endsWith('/v1')) {
+      modelsUrl = `${modelsUrl}/models`;
+    } else {
+      modelsUrl = `${modelsUrl}/v1/models`;
+    }
+
+    try {
+      const resp = await fetch(modelsUrl, {
+        headers: {
+          Authorization: config.key.startsWith('Bearer ') ? config.key : `Bearer ${config.key}`,
+        },
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (resp.status === 200) {
+        const data = await resp.json();
+        const modelList = Array.isArray(data.data) ? data.data.map((m) => m.id) : [];
+        lines.push(`API 连通性: ✓ 成功连通（/v1/models HTTP 200）`);
+        const imageModels = modelList.filter((id) => /image|dall|flux|paint/i.test(id));
+        if (imageModels.length) {
+          lines.push(`检测到可用图像模型 (${imageModels.length} 个): ${imageModels.slice(0, 6).join(', ')}${imageModels.length > 6 ? '...' : ''}`);
         }
-      } catch (error) {
-        lines.push(`${ENDPOINTS[endpoint]} ✗ ${error.message}${error.hint ? `\n  → ${error.hint}` : ''}`);
+        for (const m of config.modelList) {
+          if (modelList.includes(m)) {
+            lines.push(`配置模型 [${m}]: ✓ 已在服务可用模型列表中`);
+          } else if (modelList.length > 0) {
+            lines.push(`配置模型 [${m}]: ? 未在服务模型列表中精确匹配（仍可能支持）`);
+          }
+        }
+      } else if (resp.status === 401 || resp.status === 403) {
+        lines.push(`API 连通性: ✗ 认证失败（HTTP ${resp.status}），请检查 IMAGE_API_KEY 是否正确`);
+      } else {
+        lines.push(`API 连通性: ? 端点返回 HTTP ${resp.status}`);
       }
+    } catch (e) {
+      lines.push(`API 连通性: ✗ 无法连接 (${e.message})`);
     }
   }
 
@@ -519,7 +685,7 @@ export async function doctor(flags) {
   return lines.some((line) => line.includes('✗')) ? 1 : 0;
 }
 
-/** 统一的入口收尾：Fail 打成两行人话，其余打堆栈。 */
+/** 统一的入口收尾：Fail 打印人话，其余打印堆栈。 */
 export function run(main) {
   main()
     .then((code) => process.exit(code))
