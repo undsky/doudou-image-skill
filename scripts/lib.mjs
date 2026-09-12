@@ -47,6 +47,11 @@ export function parseSizeArg(raw, endpoint) {
       `写法是 1K / 2K / 4K，或具体像素如 ${KNOWN_GOOD_SIZE}`,
     );
   }
+  // 只验形状会让 0x0 这种没有意义的值通过（正则里 \d+ 匹配得上），发上去只会换回一个裸 400
+  const [width, height] = size.split('x').map(Number);
+  if (width === 0 || height === 0) {
+    throw new Fail(`--size ${size} 不是有效尺寸`, `宽和高都必须大于 0，如 ${KNOWN_GOOD_SIZE}`);
+  }
   if (DEAD_SIZES.includes(size)) {
     throw new Fail(
       `--size ${size} 传上去必定失败`,
@@ -72,13 +77,24 @@ export class Fail extends Error {
   }
 }
 
-/** 查找 .env 配置文件：默认查找技能目录（scripts/ 的上一级），如果没有，依次向上查找（最多向上找 3 级）。 */
+/**
+ * 查找 .env 配置文件：技能目录（scripts/ 的上一级）优先。
+ *
+ * 找不到时才向上找，且只认"技能目录所在的那个项目内部"—— 向上遇到项目根标记
+ * （.git / .claude / .agents）就到此为止，把该层也纳入查找后停下。
+ * 无条件向上找 3 级会捡到无关项目、甚至用户主目录的 .env，那里面的
+ * IMAGE_API_KEY / OPENAI_API_KEY 跟本技能毫无关系，读了只会连错服务。
+ */
 export function findEnvFile() {
   const primary = join(SKILL_DIR, '.env');
   if (existsSync(primary)) return primary;
   let curr = SKILL_DIR;
-  for (let i = 0; i < 3; i++) {
-    curr = resolve(curr, '..');
+  for (let i = 0; i < 3; i += 1) {
+    const isRoot = ROOT_MARKERS.some((m) => existsSync(join(curr, m)));
+    if (isRoot) break;                       // 已在项目根，别再往外翻
+    const parent = resolve(curr, '..');
+    if (parent === curr) break;              // 到文件系统顶了
+    curr = parent;
     const candidate = join(curr, '.env');
     if (existsSync(candidate)) return candidate;
   }
@@ -125,8 +141,22 @@ export function buildEndpointUrl(rawUrl, endpoint) {
 }
 
 // 通用（非本 skill 专属）的键名：可能是给 openai.com 官方端点准备的，不能想当然拿来配中转站。
-const GENERIC_URL_KEYS = new Set(['OPENAI_BASE_URL']);
 const GENERIC_KEY_KEYS = new Set(['OPENAI_API_KEY']);
+// $OPENAI_API_KEY 只在地址确实指向 OpenAI 官方时才认。判 host 而不是判"配没配过"：
+// .env.example 里就写着 IMAGE_API_URL=<中转站>，"配过"这个条件对默认配置恒真，等于没设防。
+const OFFICIAL_HOSTS = new Set(['api.openai.com', 'openai.com']);
+
+/** 地址的 host 是否为 OpenAI 官方端点。解析不出 host（写法不合法）时按"不是"处理。 */
+function isOfficialOpenAI(rawUrl) {
+  if (!rawUrl) return false;
+  const text = String(rawUrl).trim();
+  try {
+    const { hostname } = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `https://${text}`);
+    return OFFICIAL_HOSTS.has(hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
 
 export function resolveConfig(flags, endpoint) {
   const dotEnv = readDotEnv();
@@ -141,18 +171,20 @@ export function resolveConfig(flags, endpoint) {
 
   const rawUrl = pick(flags.url, 'IMAGE_API_URL', 'DOUDOU_IMAGE_API_URL', 'DOUDOU_API_URL', 'OPENAI_BASE_URL');
   const rawKey = pick(flags.key, 'IMAGE_API_KEY', 'DOUDOU_IMAGE_API_KEY', 'DOUDOU_API_KEY', 'OPENAI_API_KEY');
-  const models = pick(flags.models, 'IMAGE_API_MODELS', 'IMAGE_API_MODEL', 'DOUDOU_IMAGE_MODELS', 'DOUDOU_IMAGE_MODEL', 'IMAGE_MODEL');
+  // 模型列表只从环境变量 / .env 取：命令行侧 --models 是"列出清单"的布尔开关，
+  // 而单次覆盖用 --model（由 resolveModel 处理），没有"命令行传整个清单"这回事。
+  const models = pick(undefined, 'IMAGE_API_MODELS', 'IMAGE_API_MODEL', 'DOUDOU_IMAGE_MODELS', 'DOUDOU_IMAGE_MODEL', 'IMAGE_MODEL');
 
   const baseUrl = apiRoot(rawUrl.value);
   const url = buildEndpointUrl(baseUrl, endpoint);
 
-  // 防凭证外泄：$OPENAI_API_KEY 这类通用键很可能是 openai.com 的真凭证。
-  // 只有在服务地址也是显式配过的（命令行 / IMAGE_API_URL / OPENAI_BASE_URL）时才认，
-  // 否则它会被原样发往 DEFAULT_BASE_URL 这个第三方中转站。
+  // 防凭证外泄：$OPENAI_API_KEY 这类通用键很可能是 openai.com 的真凭证，
+  // 只有地址确实指向官方端点时才认。凡是发往其它 host（默认的第三方中转、自建网关、
+  // 任何一个中转站）都拦下来 —— 把官方凭证发过去等于泄露。
   const urlIsExplicit = Boolean(rawUrl.value);
   const keyIsGeneric = GENERIC_KEY_KEYS.has(rawKey.envKey);
-  const keyBlocked = keyIsGeneric && !urlIsExplicit
-    ? { source: rawKey.source, envKey: rawKey.envKey }
+  const keyBlocked = keyIsGeneric && !isOfficialOpenAI(baseUrl)
+    ? { source: rawKey.source, envKey: rawKey.envKey, target: baseUrl }
     : null;
 
   const modelList = (models.value || DEFAULT_MODEL)
@@ -165,14 +197,12 @@ export function resolveConfig(flags, endpoint) {
     url,
     urlSource: urlIsExplicit ? rawUrl.source : '默认值',
     urlIsExplicit,
-    urlIsGeneric: GENERIC_URL_KEYS.has(rawUrl.envKey),
     key: keyBlocked ? '' : rawKey.value.trim(),
     keySource: keyBlocked ? '' : rawKey.source,
     keyBlocked,
     envFile: findEnvFile(),
     modelList: modelList.length ? modelList : [DEFAULT_MODEL],
     modelsSource: models.value ? models.source : '默认值',
-    defaultModel: modelList[0] || DEFAULT_MODEL,
   };
 }
 
@@ -261,7 +291,10 @@ export function safeStem(text, limit = 24) {
     while (b > a && trim.includes(s[b - 1])) b -= 1;
     return s.slice(a, b);
   };
-  return strip(strip(out).slice(0, limit)) || 'image';
+  // 按码点截断，不用 .slice()：后者按 UTF-16 码元切，emoji（代理对）会被劈成两半，
+  // 留下孤立代理项，落盘后文件名里是一个替换字符（如 "a🐱…🐱�-时间戳.png"）。
+  const clip = (s) => [...s].slice(0, limit).join('');
+  return strip(clip(strip(out))) || 'image';
 }
 
 /** 从当前工作目录向上找 .agents / .claude / .git，找不到就用当前目录。 */
@@ -600,7 +633,13 @@ export async function fetchRemoteImage(url) {
 export function checkMask(mask, image) {
   const maskInfo = readPngInfo(mask.buffer);
   if (!maskInfo) {
-    throw new Fail('mask 必须是 PNG', `${mask.path} 按魔数是 ${mask.mime}，重新导出成 PNG`);
+    // 分两种情况说，否则"必须是 PNG"配上"按魔数是 image/png"会自相矛盾
+    throw new Fail(
+      mask.mime === 'image/png' ? 'mask 的 PNG 头读不出来（文件可能已损坏）' : 'mask 必须是 PNG',
+      mask.mime === 'image/png'
+        ? `${mask.path} 魔数是 PNG，但 IHDR 头不完整或不合法，重新导出一份`
+        : `${mask.path} 按魔数是 ${mask.mime}，重新导出成 PNG`,
+    );
   }
   if (!hasAlpha(maskInfo)) {
     throw new Fail(
@@ -638,12 +677,15 @@ export function parseArgs(argv, spec) {
     const arg = argv[i];
     if (onlyPositional) { flags.positional.push(arg); continue; }
     if (arg === '--') { onlyPositional = true; continue; }
-    if (spec.value[arg]) {
+    // 用 Object.hasOwn 而不是真值判断：spec 是普通对象字面量，`spec.value['constructor']`
+    // 会命中原型链上的 Object 构造器（真值），把提示词 "constructor" 当成选项、
+    // 顺手吞掉后一个词；"hasOwnProperty" 则会报"后面要跟一个值"。
+    if (Object.hasOwn(spec.value, arg)) {
       const value = argv[i + 1];
       if (value === undefined) throw new Fail(`${arg} 后面要跟一个值`);
       flags[spec.value[arg]] = value;
       i += 1;
-    } else if (spec.bool[arg]) {
+    } else if (Object.hasOwn(spec.bool, arg)) {
       flags[spec.bool[arg]] = true;
     } else if (arg.startsWith('-') && arg !== '-' && LOOKS_LIKE_FLAG.test(arg)) {
       const known = [...Object.keys(spec.value), ...Object.keys(spec.bool)].join(' ');
@@ -689,7 +731,9 @@ export function checkPrompt(prompt, endpoint) {
   if (text.length > max) {
     throw new Fail(
       `提示词 ${text.length} 字，超过 ${max} 字上限`,
-      endpoint === 'edit' ? '编辑接口的上限是 1000（生成接口是 8000），把描述压缩一下' : '把描述压缩一下',
+      endpoint === 'edit'
+        ? `编辑接口的上限是 ${PROMPT_MAX.edit}（生成接口是 ${PROMPT_MAX.generate}），把描述压缩一下`
+        : '把描述压缩一下',
     );
   }
   return text;
@@ -699,11 +743,11 @@ export function requireKey(config) {
   if (config.key) return;
   if (config.keyBlocked) {
     throw new Fail(
-      `检测到 ${config.keyBlocked.source}，但服务地址没有显式配过，已拒绝使用它`,
-      `$${config.keyBlocked.envKey} 通常是 openai.com 的凭证，而当前地址会走默认的 ${DEFAULT_BASE_URL}（第三方中转）——`
+      `检测到 ${config.keyBlocked.source}，但服务地址不是 OpenAI 官方端点，已拒绝使用它`,
+      `$${config.keyBlocked.envKey} 通常是 openai.com 的真凭证，而当前地址是 ${config.keyBlocked.target}（非官方）——`
       + `把它发过去等于泄露凭证，所以这里不自动套用。\n`
-      + `想用中转站：把凭证写成 IMAGE_API_KEY（<技能目录>/.env 或环境变量），或本次命令行加 --key <token>。\n`
-      + `想用官方端点：显式设置 IMAGE_API_URL=https://api.openai.com（或 --url），此时 $${config.keyBlocked.envKey} 会被采用。`,
+      + `想用当前这个地址：把该服务自己的凭证写成 IMAGE_API_KEY（<技能目录>/.env 或环境变量），或本次命令行加 --key <token>。\n`
+      + `想用官方端点：把地址设成 https://api.openai.com（IMAGE_API_URL 或 --url），此时 $${config.keyBlocked.envKey} 会被采用。`,
     );
   }
   throw new Fail(
@@ -726,9 +770,9 @@ export async function doctor(flags) {
   if (config.keyBlocked) {
     lines.push(
       `API Key: 未配置 ✗ — 检测到 ${config.keyBlocked.source}，但已拒绝使用：`
-      + `服务地址没显式配过（走默认 ${DEFAULT_BASE_URL}），把 openai.com 的凭证发去第三方中转等于泄露。`,
+      + `当前地址 ${config.keyBlocked.target} 不是 OpenAI 官方端点，把 openai.com 的凭证发过去等于泄露。`,
     );
-    lines.push('  → 用中转站：配 IMAGE_API_KEY；用官方端点：显式设 IMAGE_API_URL=https://api.openai.com');
+    lines.push('  → 用当前地址：配该服务自己的 IMAGE_API_KEY；用官方端点：设 IMAGE_API_URL=https://api.openai.com');
   } else {
     lines.push(
       config.key
@@ -801,10 +845,17 @@ export async function doctor(flags) {
   return lines.some((line) => line.includes('✗')) ? 1 : 0;
 }
 
-/** 统一的入口收尾：Fail 打印人话，其余打印堆栈。 */
+/**
+ * 统一的入口收尾：Fail 打印人话，其余打印堆栈。
+ *
+ * 只设 process.exitCode、不调 process.exit()：stdout 是管道时写入是异步的，
+ * process.exit() 会把还没 flush 的部分直接丢掉（实测超过 64KB 的管道缓冲区就截断）。
+ * --json 会回显 prompt，32000 字中文约 96KB，下游 JSON.parse 会拿到半截数据。
+ * 设 exitCode 后让事件循环自然退出，Node 会把 stdout 排空。
+ */
 export function run(main) {
   main()
-    .then((code) => process.exit(code))
+    .then((code) => { process.exitCode = code; })
     .catch((error) => {
       if (error instanceof Fail) {
         console.error(`错误：${error.message}`);
@@ -812,6 +863,6 @@ export function run(main) {
       } else {
         console.error(`意外错误：${error?.stack || error}`);
       }
-      process.exit(1);
+      process.exitCode = 1;
     });
 }

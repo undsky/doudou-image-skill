@@ -160,9 +160,10 @@ node scripts/edit.mjs photo.png '把这块区域画成一盆绿植' --mask mask.
 | 可用模型列表 | `IMAGE_API_MODELS` | `--model` | 多个逗号分隔，未指明且多模型时供选择 |
 
 > [!WARNING]
-> **`$OPENAI_API_KEY` 不会被自动套用。** 它通常是 openai.com 的真凭证，而服务地址不配时会走
-> 默认的第三方中转 —— 直接发过去等于泄露。脚本会拦住并说明：要么把凭证写成 `IMAGE_API_KEY`，
-> 要么显式设 `IMAGE_API_URL`（此时才认 `$OPENAI_API_KEY`）。
+> **`$OPENAI_API_KEY` 只在服务地址确实是 OpenAI 官方时才会被采用。** 它通常是 openai.com 的
+> 真凭证，发去中转站 / 自建网关等于泄露 —— 所以脚本按地址的 host 判断：不是 `api.openai.com`
+> 就拦住并说明。要么把该服务自己的凭证写成 `IMAGE_API_KEY`，要么把地址设成
+> `IMAGE_API_URL=https://api.openai.com`（此时才认 `$OPENAI_API_KEY`）。
 
 配置类问题先跑自检（探连通性与可用模型，不耗生图配额）：
 
@@ -185,5 +186,5 @@ node scripts/generate.mjs --doctor
 | `等了 N 秒没等到响应` | 接口超时。用 `--timeout` 延长等待时间 |
 | `mask 尺寸必须和原图一致` | 报错里给出了两边尺寸，按原图尺寸重新生成 mask |
 | `不认识的选项：-xxx` | 描述以 `-` 开头时，在它前面加 `--`。带中文或空格的描述不受影响，可直接传 |
-| `已拒绝使用 $OPENAI_API_KEY` | 见上面前置配置的 WARNING：配 `IMAGE_API_KEY`，或显式设 `IMAGE_API_URL` |
+| `已拒绝使用 $OPENAI_API_KEY` | 见上面前置配置的 WARNING：地址不是官方端点时不认这个键。配 `IMAGE_API_KEY`，或把地址设成 `https://api.openai.com` |
 | `--doctor` 报 `? 30 秒内没响应` | 这台服务 `/v1/models` 实测 4-12 秒且偶发失败，再跑一次；持续如此才是服务侧问题 |
