@@ -59,20 +59,34 @@ npx skills add undsky/doudou-image-skill --yes
 
 ## ⚙️ 环境配置指南
 
-### 1. 配置文件模板 (`.env`)
+### 1. 配置文件 (`config.json`)
 
-在项目根目录或技能安装目录下创建 `.env` 文件：
+复制技能安装目录或项目根目录下的 `config.json.example` 为 `config.json`，并填入真实凭据：
 
-```env
-# 图像大模型 API 访问凭据 (必填)
-DOUDOU_IMAGE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-# 图像服务 Base URL (必填)
-DOUDOU_IMAGE_API_URL=https://your-api-endpoint.com
-
-# 默认支持模型清单 (可选，多个以英文逗号分隔)
-DOUDOU_IMAGE_API_MODELS=gpt-image-2,gpt-image-2-2k,dall-e-3
+```json
+{
+  "default_source": "qkmss",
+  "sources": [
+    {
+      "id": "qkmss",
+      "name": "Qkmss (默认源)",
+      "url": "https://qkmss.com",
+      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "models": ["gpt-image-2", "gpt-image-2.5"]
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI 官方",
+      "url": "https://api.openai.com",
+      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "models": ["dall-e-3"]
+    }
+  ]
+}
 ```
+
+- **多源切换**：可通过 `--source <id>` 指定 API 源，或通过 `--model <name>` 自动智能路由。
+- **配置路径**：脚本会自动查找 `config.json`，亦可通过环境变量 `DOUDOU_IMAGE_CONFIG_FILE` 指定。
 
 ### 2. 环境与连通性自检
 

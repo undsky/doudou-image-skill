@@ -44,14 +44,16 @@ node scripts/generate.mjs <描述> [选项]
 |---|---|---|
 | `-n <1-10>` | 生成几张 | `1` |
 | `-o, --output <路径>` | 具体文件名、目录（以 `/` 结尾），或省略 | 见「产物存哪里」 |
+| `--source <源ID/名>` | 指定使用的 API 源 | 多源未指定时根据模型自动路由或提示选择 |
+| `--sources` | 列出当前配置的所有可用源 | — |
 | `--model <名字>` | 指定模型 | 若多模型未指明则列出供用户选 |
-| `--models` | 只列出当前配置的模型，不出图 | — |
+| `--models` | 只列出当前配置的模型，不出图 | 可配合 `--source` 仅列指定源 |
 | `--size <尺寸>` | `1K`、`2K`、`4K` 或具体像素如 `1024x1024` | **不传就不下发**，由上游取默认 |
 | `--prompt-file <文件>` | 从文件读描述，长 prompt 用它免去 shell 转义 | — |
 | `--json` | 输出结构化 JSON（含落盘路径，**不含** base64） | 关 |
 | `--timeout <秒>` | 等待上限 | `300` |
-| `--url` / `--key` | 覆盖服务地址 / 访问凭证 | 读 `.env` |
-| `--doctor` | 自检配置和连通性，不生成任何图片 | — |
+| `--url` / `--key` | 覆盖服务地址 / 访问凭证 | 覆盖选定源的配置 |
+| `--doctor` | 自检配置和连通性，不生成任何图片 | 可配合 `--source` 仅测指定源 |
 | `--` | 之后的内容一律当描述（描述以 `-` 开头时用它） | — |
 
 提示词上限 **32000 字**（按接口文档，具体模型可能更低）。`n` 上限 10，但部分模型只支持 1。
@@ -72,6 +74,8 @@ node scripts/edit.mjs <图片> <怎么改> [选项]
 | `-n <1-10>` | 生成几张 | `1` |
 | `--size <尺寸>` | `1K`、`2K`、`4K` 或具体像素 | **不传就不下发**，保持原图比例 |
 | `-o, --output <路径>` | 同上 | 见「产物存哪里」 |
+| `--source <源ID/名>` | 指定使用的 API 源 | 同上 |
+| `--sources` | 列出当前配置的所有可用源 | — |
 | `--model <名字>` | 指定模型 | 若多模型未指明则列出供用户选 |
 | `--models` | 只列出当前配置的模型，不出图 | — |
 | `--prompt-file <文件>` | 从文件读编辑描述 | — |
@@ -140,32 +144,48 @@ node scripts/edit.mjs photo.png '把这块区域画成一盆绿植' --mask mask.
      - 改图**一律不传** `--size`：会把非方图拉变形。
      - `256x256` / `512x512` 传了必挂，脚本本地就会拦，不必试。
 
-- **模型选择规则**：
-     - 用户已指明模型时（如"用 gpt-image-2 画..."）：直接带上 `--model <模型>`。
+- **多源与模型选择规则**：
+     - **指定源**：可通过 `--source <id>` 指定 API 源。可用 `--sources` 查看当前配置的所有可用源。
+     - **智能模型路由**：传 `--model <模型>` 时，若配置中仅有 1 个源包含该模型，脚本将**自动切换**至该源，无需额外指定 `--source`。
      - 用户未指明模型时：
-       - **若配置中只有 1 个模型**：直接使用该模型，**不需要询问用户**。
-       - **若配置中有多个模型**：**将可选模型列出供用户选择**。用 `--models` 拿列表。
+       - **若选定源中只有 1 个模型**：直接使用该模型，**不需要询问用户**。
+       - **若选定源中有多个模型**：**将可选模型列出供用户选择**。用 `--models` 拿列表。
 
 - **生成是公开服务、要花额度的**。别为了"多几个选项"反复重跑，`-n` 一次要够。
 - **别把用户没打算公开的图**（证件、私密照、内部截图）传给修图接口。
 
 ## 前置配置
 
-按 命令行 > 环境变量 > **技能目录的 `.env`** 取值。
+统一使用 JSON 配置文件管理 API 源与凭据。
 
-| 配置项 | `.env` 键名 | 命令行 | 必需性 |
-|---|---|---|---|
-| 服务地址 | `DOUDOU_IMAGE_API_URL`（兼容 `IMAGE_API_URL`） | `--url` | **必填**，填服务根地址即可，端点路径由脚本拼 |
-| 访问凭证 | `DOUDOU_IMAGE_API_KEY`（兼容 `IMAGE_API_KEY`） | `--key` | **必填**，`sk-...` 格式 |
-| 可用模型列表 | `DOUDOU_IMAGE_API_MODELS`（兼容 `IMAGE_API_MODELS`） | `--model` | 多个逗号分隔，未指明且多模型时供选择 |
+复制技能目录下的 `config.json.example` 为 `config.json`，即可配置一个或多个提供商：
 
-> [!WARNING]
-> **`$OPENAI_API_KEY` 只在服务地址确实是 OpenAI 官方时才会被采用。** 它通常是 openai.com 的
-> 真凭证，发去中转站 / 自建网关等于泄露 —— 所以脚本按地址的 host 判断：不是 `api.openai.com`
-> 就拦住并说明。要么把该服务自己的凭证写成 `DOUDOU_IMAGE_API_KEY`，要么把地址设成
-> `DOUDOU_IMAGE_API_URL=https://api.openai.com`（此时才认 `$OPENAI_API_KEY`）。
+```json
+{
+  "default_source": "qkmss",
+  "sources": [
+    {
+      "id": "qkmss",
+      "name": "Qkmss (默认源)",
+      "url": "https://qkmss.com",
+      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "models": ["gpt-image-2", "gpt-image-2.5"]
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI 官方",
+      "url": "https://api.openai.com",
+      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "models": ["dall-e-3"]
+    }
+  ]
+}
+```
 
-配置类问题先跑自检（探连通性与可用模型，不耗生图配额）：
+- **配置文件定位**：脚本会自动在技能目录或项目根查找 `config.json`。
+- **自定义路径**：可通过环境变量 `DOUDOU_IMAGE_CONFIG_FILE=/path/to/config.json` 指定。
+
+配置类问题先跑自检（探连通性与可用模型，不耗生图配额；会逐源诊断）：
 
 ```bash
 node scripts/generate.mjs --doctor
@@ -177,8 +197,9 @@ node scripts/generate.mjs --doctor
 
 | 错误特征 | 含义与处理 |
 |---|---|
-| `HTTP 401 / 403` | API Key 没配、填错或已被禁用。检查 `IMAGE_API_KEY` 是否正确 |
-| `HTTP 404` | 端点不存在。检查 `IMAGE_API_URL` 是否配置了正确的 Base URL |
+| `未找到图像配置文件 config.json` | 尚未创建配置文件。请复制 `config.json.example` 为 `config.json` 并填入有效凭证 |
+| `HTTP 401 / 403` | API Key 没配、填错或已被禁用。检查 `config.json` 中对应源的 `key` 是否正确 |
+| `HTTP 404` | 端点不存在。检查 `config.json` 中对应源的 `url` 是否正确 |
 | `HTTP 429` | 频率超限或账户余额已耗尽 |
 | `model_not_found` / `无可用渠道`（本服务用 **503** 报这个） | **配置问题，不是抖动，重试不会好。** 换模型（`--model`）或在服务商后台开渠道。脚本已把这种情况从"稍后重试"里摘出来单独提示 |
 | `HTTP 5xx`（非上条） | 上游生图服务暂时故障，稍后重试 |
@@ -186,5 +207,4 @@ node scripts/generate.mjs --doctor
 | `等了 N 秒没等到响应` | 接口超时。用 `--timeout` 延长等待时间 |
 | `mask 尺寸必须和原图一致` | 报错里给出了两边尺寸，按原图尺寸重新生成 mask |
 | `不认识的选项：-xxx` | 描述以 `-` 开头时，在它前面加 `--`。带中文或空格的描述不受影响，可直接传 |
-| `已拒绝使用 $OPENAI_API_KEY` | 见上面前置配置的 WARNING：地址不是官方端点时不认这个键。配 `IMAGE_API_KEY`，或把地址设成 `https://api.openai.com` |
 | `--doctor` 报 `? 30 秒内没响应` | 这台服务 `/v1/models` 实测 4-12 秒且偶发失败，再跑一次；持续如此才是服务侧问题 |

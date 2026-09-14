@@ -77,47 +77,45 @@ export class Fail extends Error {
   }
 }
 
+export const CONFIG_FILE_NAME = 'config.json';
+
 /**
- * 查找 .env 配置文件：技能目录（scripts/ 的上一级）优先。
- *
- * 找不到时才向上找，且只认"技能目录所在的那个项目内部"—— 向上遇到项目根标记
- * （.git / .claude / .agents）就到此为止，把该层也纳入查找后停下。
- * 无条件向上找 3 级会捡到无关项目、甚至用户主目录的 .env，那里面的
- * IMAGE_API_KEY / OPENAI_API_KEY 跟本技能毫无关系，读了只会连错服务。
+ * 查找配置文件 config.json。
+ * 优先检查 customPath，其次检查技能目录，再向上查找项目根。
  */
-export function findEnvFile() {
-  const primary = join(SKILL_DIR, '.env');
-  if (existsSync(primary)) return primary;
+export function findConfigFile(customPath) {
+  if (customPath) {
+    const resolved = resolve(process.cwd(), customPath);
+    if (existsSync(resolved)) return resolved;
+    const fromSkill = resolve(SKILL_DIR, customPath);
+    if (existsSync(fromSkill)) return fromSkill;
+    throw new Fail(`指定的配置文件不存在：${customPath}`, '请检查文件路径是否正确');
+  }
+
+  // 1. 优先在技能目录下找
+  const inSkill = join(SKILL_DIR, CONFIG_FILE_NAME);
+  if (existsSync(inSkill)) return inSkill;
+
+  // 2. 向上找项目根（最多 3 级）
   let curr = SKILL_DIR;
   for (let i = 0; i < 3; i += 1) {
     const isRoot = ROOT_MARKERS.some((m) => existsSync(join(curr, m)));
-    if (isRoot) break;                       // 已在项目根，别再往外翻
+    if (isRoot) break;
     const parent = resolve(curr, '..');
-    if (parent === curr) break;              // 到文件系统顶了
+    if (parent === curr) break;
     curr = parent;
-    const candidate = join(curr, '.env');
-    if (existsSync(candidate)) return candidate;
+    const inParent = join(curr, CONFIG_FILE_NAME);
+    if (existsSync(inParent)) return inParent;
   }
-  return primary;
+  return null;
 }
 
-// ---- 配置：命令行 > 环境变量 > .env ----
-function readDotEnv() {
-  const path = findEnvFile();
-  if (!existsSync(path)) return {};
-  const out = {};
-  for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eq = trimmed.indexOf('=');
-    if (eq <= 0) continue;
-    let value = trimmed.slice(eq + 1).trim();
-    if (value.length >= 2 && (value[0] === '"' || value[0] === "'") && value.at(-1) === value[0]) {
-      value = value.slice(1, -1);
-    }
-    out[trimmed.slice(0, eq).trim()] = value;
-  }
-  return out;
+/** 脱敏打印 Key */
+export function maskKey(key) {
+  if (!key) return '（未配置）';
+  const str = String(key).trim();
+  if (str.length <= 10) return `${str.slice(0, 3)}...`;
+  return `${str.slice(0, 7)}...${str.slice(-4)}`;
 }
 
 /**
@@ -140,69 +138,215 @@ export function buildEndpointUrl(rawUrl, endpoint) {
   return `${apiRoot(rawUrl)}${ENDPOINTS[endpoint]}`;
 }
 
-// 通用（非本 skill 专属）的键名：可能是给 openai.com 官方端点准备的，不能想当然拿来配中转站。
-const GENERIC_KEY_KEYS = new Set(['OPENAI_API_KEY']);
-// $OPENAI_API_KEY 只在地址确实指向 OpenAI 官方时才认。判 host 而不是判"配没配过"：
-// .env.example 里就写着 IMAGE_API_URL=<中转站>，"配过"这个条件对默认配置恒真，等于没设防。
-const OFFICIAL_HOSTS = new Set(['api.openai.com', 'openai.com']);
-
-/** 地址的 host 是否为 OpenAI 官方端点。解析不出 host（写法不合法）时按"不是"处理。 */
-function isOfficialOpenAI(rawUrl) {
-  if (!rawUrl) return false;
-  const text = String(rawUrl).trim();
-  try {
-    const { hostname } = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `https://${text}`);
-    return OFFICIAL_HOSTS.has(hostname.toLowerCase());
-  } catch {
-    return false;
+/** 表示一个 API 图像源 */
+export class ApiSource {
+  constructor({ id, name, url, key, models, isDefault = false, configSource = '', keySource = '', urlSource = '' }) {
+    this.id = String(id || '').trim() || 'default';
+    this.name = String(name || this.id).trim();
+    this.url = String(url || '').trim();
+    this.baseUrl = apiRoot(this.url || DEFAULT_BASE_URL);
+    this.key = String(key || '').trim();
+    this.models = Array.isArray(models)
+      ? models.map((m) => String(m).trim()).filter(Boolean)
+      : (typeof models === 'string'
+          ? models.split(/[,，\s]+/).map((m) => m.trim()).filter(Boolean)
+          : []);
+    if (this.models.length === 0) {
+      this.models = [DEFAULT_MODEL];
+    }
+    this.isDefault = Boolean(isDefault);
+    this.configSource = configSource;
+    this.keySource = keySource || configSource;
+    this.urlSource = urlSource || configSource;
   }
 }
 
-export function resolveConfig(flags, endpoint) {
-  const dotEnv = readDotEnv();
-  const pick = (flagValue, ...envKeys) => {
-    if (flagValue) return { value: flagValue, source: '命令行', envKey: '' };
-    for (const envKey of envKeys) {
-      if (process.env[envKey]) return { value: process.env[envKey], source: `环境变量 $${envKey}`, envKey };
-      if (dotEnv[envKey]) return { value: dotEnv[envKey], source: `.env (${envKey})`, envKey };
+/**
+ * 加载所有配置的源：从 config.json 加载。
+ * 找不到配置文件时抛出 Fail 错误，提示用户创建。
+ */
+export function loadSources(flags = {}) {
+  const customConfigPath = flags.configFile || process.env.DOUDOU_IMAGE_CONFIG_FILE;
+  const configFilePath = findConfigFile(customConfigPath);
+
+  if (!configFilePath) {
+    throw new Fail(
+      '未找到图像配置文件 config.json',
+      `请复制技能目录下的 config.json.example 为 config.json，并配置 API 地址、访问凭证（Key）与模型列表。\n`
+      + `参考命令：cp ${join(SKILL_DIR, 'config.json.example')} ${join(SKILL_DIR, 'config.json')}`,
+    );
+  }
+
+  let sources = [];
+  let defaultSourceId = '';
+  const configDesc = `${basename(configFilePath)} (${configFilePath})`;
+
+  try {
+    const content = readFileSync(configFilePath, 'utf8');
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed)) {
+      sources = parsed.map((item, idx) => new ApiSource({
+        ...item,
+        isDefault: Boolean(item.default || item.isDefault || idx === 0),
+        configSource: `${basename(configFilePath)} [#${idx + 1}]`,
+        keySource: `${basename(configFilePath)}`,
+      }));
+    } else if (parsed && typeof parsed === 'object') {
+      defaultSourceId = String(parsed.default_source || parsed.defaultSource || '').trim();
+      const rawList = Array.isArray(parsed.sources)
+        ? parsed.sources
+        : (parsed.sources && typeof parsed.sources === 'object'
+            ? Object.entries(parsed.sources).map(([k, v]) => ({ id: k, ...v }))
+            : []);
+      sources = rawList.map((item, idx) => new ApiSource({
+        ...item,
+        isDefault: defaultSourceId ? item.id === defaultSourceId : Boolean(item.default || item.isDefault || idx === 0),
+        configSource: `${basename(configFilePath)} [${item.id || idx + 1}]`,
+        keySource: `${basename(configFilePath)}`,
+      }));
     }
-    return { value: '', source: '', envKey: '' };
-  };
+  } catch (e) {
+    if (e instanceof Fail) throw e;
+    throw new Fail(`解析配置文件失败：${configFilePath}`, `JSON 语法错误：${e.message}`);
+  }
 
-  const rawUrl = pick(flags.url, 'DOUDOU_IMAGE_API_URL', 'IMAGE_API_URL', 'DOUDOU_API_URL', 'OPENAI_BASE_URL');
-  const rawKey = pick(flags.key, 'DOUDOU_IMAGE_API_KEY', 'IMAGE_API_KEY', 'DOUDOU_API_KEY', 'OPENAI_API_KEY');
-  // 模型列表只从环境变量 / .env 取：命令行侧 --models 是"列出清单"的布尔开关，
-  // 而单次覆盖用 --model（由 resolveModel 处理），没有"命令行传整个清单"这回事。
-  const models = pick(undefined, 'DOUDOU_IMAGE_API_MODELS', 'IMAGE_API_MODELS', 'DOUDOU_IMAGE_MODELS', 'IMAGE_API_MODEL', 'DOUDOU_IMAGE_MODEL', 'IMAGE_MODEL');
+  if (sources.length === 0) {
+    throw new Fail(
+      `配置文件 ${basename(configFilePath)} 中未定义任何有效源`,
+      '请参考 config.json.example 在 sources 数组中添加至少一个配置项',
+    );
+  }
 
-  const baseUrl = apiRoot(rawUrl.value);
-  const url = buildEndpointUrl(baseUrl, endpoint);
+  // 确保至少有且仅有一个 isDefault
+  const defaultIdx = sources.findIndex((s) => s.isDefault);
+  if (defaultIdx === -1 && sources.length > 0) {
+    sources[0].isDefault = true;
+  }
 
-  // 防凭证外泄：$OPENAI_API_KEY 这类通用键很可能是 openai.com 的真凭证，
-  // 只有地址确实指向官方端点时才认。凡是发往其它 host（默认的第三方中转、自建网关、
-  // 任何一个中转站）都拦下来 —— 把官方凭证发过去等于泄露。
-  const urlIsExplicit = Boolean(rawUrl.value);
-  const keyIsGeneric = GENERIC_KEY_KEYS.has(rawKey.envKey);
-  const keyBlocked = keyIsGeneric && !isOfficialOpenAI(baseUrl)
-    ? { source: rawKey.source, envKey: rawKey.envKey, target: baseUrl }
-    : null;
-
-  const modelList = (models.value || DEFAULT_MODEL)
-    .split(/[,，\s]+/)
-    .map((m) => m.trim())
-    .filter(Boolean);
+  const defaultSource = sources.find((s) => s.isDefault) || sources[0];
 
   return {
+    sources,
+    defaultSource,
+    configDesc,
+    configFile: configFilePath,
+  };
+}
+
+/**
+ * 根据命令行选项与模型智能匹配当前所用的源
+ */
+export async function resolveSource(flags, sourcesInfo) {
+  const { sources, defaultSource } = sourcesInfo;
+
+  // 1. 命令行显式指定了 --source
+  if (flags.source) {
+    const query = String(flags.source).trim().toLowerCase();
+    const matched = sources.find((s) => s.id.toLowerCase() === query || s.name.toLowerCase() === query);
+    if (!matched) {
+      throw new Fail(
+        `找不到指定的源：${flags.source}`,
+        `当前配置的可用源：\n${sources.map((s, i) => `  ${i + 1}. [${s.id}] ${s.name}${s.isDefault ? ' (默认)' : ''}`).join('\n')}\n使用 --sources 查看完整列表。`,
+      );
+    }
+    return matched;
+  }
+
+  // 2. 命令行未传 --source，但传了 --model：智能模型路由
+  if (flags.model) {
+    const targetModel = String(flags.model).trim();
+    const candidates = sources.filter((s) => s.models.includes(targetModel));
+    if (candidates.length === 1) {
+      // 唯一源支持该模型：自动选定该源
+      return candidates[0];
+    }
+    if (candidates.length > 1) {
+      // 多个源均支持：优先选默认源（如果默认源支持）
+      if (candidates.some((s) => s.id === defaultSource.id)) {
+        return defaultSource;
+      }
+      // 默认源不在其中且是交互式终端：提示用户选择源
+      if (process.stdin.isTTY) {
+        info(`检测到模型 [${targetModel}] 存在于多个源中，请选择使用的源（直接回车默认第 1 项）：`);
+        for (let i = 0; i < candidates.length; i++) {
+          info(`  ${i + 1}) [${candidates[i].id}] ${candidates[i].name}`);
+        }
+        const rl = createInterface({ input: process.stdin, output: process.stderr });
+        try {
+          const answer = (await rl.question(`请输入源序号 (1-${candidates.length}) [1]: `)).trim();
+          const idx = answer ? parseInt(answer, 10) - 1 : 0;
+          if (Number.isInteger(idx) && idx >= 0 && idx < candidates.length) {
+            return candidates[idx];
+          }
+          return candidates[0];
+        } finally {
+          rl.close();
+        }
+      }
+      // 非交互式：默认回退到候选的第 1 项，并输出说明
+      info(`注意：模型 [${targetModel}] 存在于多个源中，已默认选用 [${candidates[0].id}]（可用 --source <id> 显式指定）`);
+      return candidates[0];
+    }
+    // 未在任何源的模型列表中匹配（可能是用户直接指定的外部模型）：回退到默认源
+    return defaultSource;
+  }
+
+  // 3. 既未传 --source 也未传 --model
+  // 若只有一个源：直接使用
+  if (sources.length === 1) {
+    return sources[0];
+  }
+
+  // 多个源：在交互式终端且没有明确单选时，询问用户选择源；若未交互则使用默认源
+  if (process.stdin.isTTY && !flags.source) {
+    info(`当前配置了 ${sources.length} 个可用源，请选择（直接回车默认使用 [${defaultSource.id}] ${defaultSource.name}）：`);
+    for (let i = 0; i < sources.length; i++) {
+      info(`  ${i + 1}) [${sources[i].id}] ${sources[i].name}${sources[i].isDefault ? ' (默认)' : ''}`);
+    }
+    const rl = createInterface({ input: process.stdin, output: process.stderr });
+    try {
+      const defaultIdx = sources.findIndex((s) => s.id === defaultSource.id);
+      const answer = (await rl.question(`请输入源序号 (1-${sources.length}) [${defaultIdx + 1}]: `)).trim();
+      const idx = answer ? parseInt(answer, 10) - 1 : defaultIdx;
+      if (Number.isInteger(idx) && idx >= 0 && idx < sources.length) {
+        return sources[idx];
+      }
+      return defaultSource;
+    } finally {
+      rl.close();
+    }
+  }
+
+  return defaultSource;
+}
+
+/**
+ * 解析并确定最终运行配置（URL、Key、选定源与模型列表）
+ */
+export async function resolveConfig(flags, endpoint) {
+  const sourcesInfo = loadSources(flags);
+  const selectedSource = await resolveSource(flags, sourcesInfo);
+
+  // 命令行显式传参优先级最高
+  const baseUrl = flags.url ? apiRoot(flags.url) : selectedSource.baseUrl;
+  const url = buildEndpointUrl(baseUrl, endpoint);
+  const key = flags.key !== undefined ? String(flags.key).trim() : selectedSource.key;
+  const keySource = flags.key !== undefined ? '命令行' : selectedSource.keySource;
+  const urlSource = flags.url ? '命令行' : selectedSource.urlSource;
+
+  return {
+    source: selectedSource,
+    sources: sourcesInfo.sources,
+    sourcesInfo,
     baseUrl,
     url,
-    urlSource: urlIsExplicit ? rawUrl.source : '默认值',
-    urlIsExplicit,
-    key: keyBlocked ? '' : rawKey.value.trim(),
-    keySource: keyBlocked ? '' : rawKey.source,
-    keyBlocked,
-    envFile: findEnvFile(),
-    modelList: modelList.length ? modelList : [DEFAULT_MODEL],
-    modelsSource: models.value ? models.source : '默认值',
+    urlSource,
+    urlIsExplicit: Boolean(flags.url || selectedSource.url),
+    key,
+    keySource,
+    configFile: sourcesInfo.configFile,
+    modelList: selectedSource.models,
+    modelsSource: selectedSource.configSource,
   };
 }
 
@@ -214,7 +358,7 @@ export function resolveConfig(flags, endpoint) {
  *    - 交互式终端 (TTY)：提供编号交互选择；
  *    - 非交互终端（如 AI/脚本）：抛出 Fail 错误，列出所有可选模型，要求指定 --model。
  */
-export async function resolveModel(flags, modelList) {
+export async function resolveModel(flags, modelList, sourceName = '') {
   if (flags.model) {
     return String(flags.model).trim();
   }
@@ -225,9 +369,11 @@ export async function resolveModel(flags, modelList) {
     return modelList[0];
   }
 
+  const prefix = sourceName ? `【${sourceName}】` : '';
+
   // 交互式终端 (TTY) 提示选择
   if (process.stdin.isTTY) {
-    info(`当前配置了 ${modelList.length} 个可用模型，请选择（直接回车默认第 1 项）：`);
+    info(`${prefix}当前配置了 ${modelList.length} 个可用模型，请选择（直接回车默认第 1 项）：`);
     for (let i = 0; i < modelList.length; i++) {
       info(`  ${i + 1}) ${modelList[i]}`);
     }
@@ -247,9 +393,83 @@ export async function resolveModel(flags, modelList) {
 
   // 非交互终端：列出选项报错
   throw new Fail(
-    `未指定使用哪个模型。当前配置了 ${modelList.length} 个可用模型：${modelList.join('、')}`,
+    `${prefix}未指定使用哪个模型。当前可用模型：${modelList.join('、')}`,
     `请向用户确认后，使用 --model <名字> 显式指定。\n可选模型：\n${modelList.map((m, i) => `  ${i + 1}. ${m}`).join('\n')}`,
   );
+}
+
+/** 格式化输出所有配置的源（供 --sources 使用） */
+export function formatSourcesOutput(sourcesInfo, asJson = false) {
+  const { sources, configDesc } = sourcesInfo;
+  if (asJson) {
+    const list = sources.map((s) => ({
+      id: s.id,
+      name: s.name,
+      url: s.url || s.baseUrl,
+      is_default: s.isDefault,
+      has_key: Boolean(s.key),
+      masked_key: maskKey(s.key),
+      models: s.models,
+      source: s.configSource,
+    }));
+    return `${JSON.stringify(list, null, 2)}\n`;
+  }
+
+  const lines = [];
+  lines.push(`配置文件: ${configDesc}`);
+  lines.push(`可用源数量: ${sources.length} 个`);
+  lines.push('------------------------------------------------------------');
+  for (let i = 0; i < sources.length; i++) {
+    const s = sources[i];
+    const flag = s.isDefault ? '* ' : '  ';
+    lines.push(`${flag}${i + 1}. [${s.id}] ${s.name}${s.isDefault ? ' (默认源)' : ''}`);
+    lines.push(`     服务地址: ${s.baseUrl}`);
+    lines.push(`     访问凭证: ${s.key ? `已配置 (${maskKey(s.key)})` : '未配置 ✗'}`);
+    lines.push(`     可用模型: ${s.models.join(', ')} (${s.models.length} 个)`);
+    if (i < sources.length - 1) lines.push('');
+  }
+  lines.push('------------------------------------------------------------');
+  lines.push('提示: 带 * 的为默认源。可用 --source <id> 指定源，或通过 --model <name> 自动匹配对应源。');
+  return `${lines.join('\n')}\n`;
+}
+
+/** 格式化输出模型列表（供 --models 使用） */
+export function formatModelsOutput(sourcesInfo, flags, asJson = false) {
+  const { sources } = sourcesInfo;
+  let targetSources = sources;
+  if (flags.source) {
+    const query = String(flags.source).trim().toLowerCase();
+    targetSources = sources.filter((s) => s.id.toLowerCase() === query || s.name.toLowerCase() === query);
+    if (targetSources.length === 0) {
+      throw new Fail(`找不到指定的源：${flags.source}`);
+    }
+  }
+
+  if (asJson) {
+    if (targetSources.length === 1) {
+      return `${JSON.stringify(targetSources[0].models, null, 2)}\n`;
+    }
+    const map = {};
+    for (const s of targetSources) {
+      map[s.id] = { name: s.name, models: s.models };
+    }
+    return `${JSON.stringify(map, null, 2)}\n`;
+  }
+
+  // 纯文本输出：若只有一个源，直接按行输出模型名字（与原有逻辑 100% 保持一致）
+  if (targetSources.length === 1) {
+    return `${targetSources[0].models.join('\n')}\n`;
+  }
+
+  // 多个源：按源分组输出
+  const lines = [];
+  for (const s of targetSources) {
+    lines.push(`[${s.id}] ${s.name}${s.isDefault ? ' (默认)' : ''}:`);
+    for (const m of s.models) {
+      lines.push(`  - ${m}`);
+    }
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 // ---- 展示辅助 ----
@@ -355,7 +575,7 @@ export async function post(config, body, { timeoutMs, isJson }) {
       throw new Fail(`连不上接口地址：${config.url}`, '检查服务地址是否拼写正确，或网络是否通畅');
     }
     if (/ENOTFOUND|EAI_AGAIN/i.test(chain)) {
-      throw new Fail(`域名解析不了：${config.url}`, '检查 IMAGE_API_URL 拼写');
+      throw new Fail(`域名解析不了：${config.url}`, '检查配置文件中该源的服务地址 url 拼写');
     }
     if (/ECONNRESET|EPIPE|UND_ERR_SOCKET/i.test(chain)) {
       throw new Fail(
@@ -376,7 +596,7 @@ export async function post(config, body, { timeoutMs, isJson }) {
     if (response.status === 404) {
       throw new Fail(
         `端点不存在（404）：${config.url}`,
-        '请检查服务地址 IMAGE_API_URL 是否配置正确（填服务根地址即可，端点路径由脚本拼接）',
+        '请检查配置文件中该源的服务地址 url 是否配置正确（填服务根地址即可，端点路径由脚本拼接）',
       );
     }
     // 网关超时/故障时回的是 HTML 错误页（Cloudflare 的 502/504/524 等）。
@@ -434,9 +654,9 @@ export function explain(status, json, config, notes = {}) {
   } else if (status === 401 || status === 403) {
     hints.push(config.key
       ? `API Key 认证未通过（来自${config.keySource}）。请检查凭证是否正确有效、额度是否充足。`
-      : '未配置 API Key。请在 <技能目录>/.env 中配置 IMAGE_API_KEY，或在命令行使用 --key <token>。');
+      : `未配置 API Key。请在配置文件中为当前源 [${config.source?.id || 'default'}] 配置 key，或在命令行使用 --key <token>。`);
   } else if (status === 404) {
-    hints.push(`端点不存在（404）：${config.url}。请检查服务地址 IMAGE_API_URL 是否正确（填服务根地址即可，端点路径由脚本拼接）。`);
+    hints.push(`端点不存在（404）：${config.url}。请检查配置文件中该源的服务地址 url 是否正确（填服务根地址即可，端点路径由脚本拼接）。`);
   } else if (status === 429) {
     hints.push('请求受限（429）：API 速率超限或账户额度已耗尽，请稍后再试或检查账户余额。');
   } else if (status >= 500) {
@@ -741,18 +961,9 @@ export function checkPrompt(prompt, endpoint) {
 
 export function requireKey(config) {
   if (config.key) return;
-  if (config.keyBlocked) {
-    throw new Fail(
-      `检测到 ${config.keyBlocked.source}，但服务地址不是 OpenAI 官方端点，已拒绝使用它`,
-      `$${config.keyBlocked.envKey} 通常是 openai.com 的真凭证，而当前地址是 ${config.keyBlocked.target}（非官方）——`
-      + `把它发过去等于泄露凭证，所以这里不自动套用。\n`
-      + `想用当前这个地址：把该服务自己的凭证写成 IMAGE_API_KEY（<技能目录>/.env 或环境变量），或本次命令行加 --key <token>。\n`
-      + `想用官方端点：把地址设成 https://api.openai.com（IMAGE_API_URL 或 --url），此时 $${config.keyBlocked.envKey} 会被采用。`,
-    );
-  }
   throw new Fail(
-    '未配置 API 访问凭证（Key）',
-    '设置环境变量 IMAGE_API_KEY，或写进 <技能目录>/.env，也可以在本次命令行使用 --key <token> 传递。',
+    `当前源 [${config.source?.id || 'default'}] 未配置 API 访问凭证（Key）`,
+    `请在配置文件 ${basename(config.configFile || 'config.json')} 中为 [${config.source?.id || 'default'}] 填入 key，或在命令行使用 --key <token> 传递。`,
   );
 }
 
@@ -763,86 +974,109 @@ export async function doctor(flags) {
   const major = Number(process.versions.node.split('.')[0]);
   lines.push(`Node ${process.versions.node} ${major >= 18 ? '✓' : '✗ 需要 18+（fetch / FormData / Blob）'}`);
 
-  const config = resolveConfig(flags, 'generate');
-  lines.push(`服务 Base URL: ${config.baseUrl}（来自${config.urlSource}）`);
-  lines.push(`生图端点: ${config.url}`);
-  lines.push(`.env 位置: ${config.envFile}${existsSync(config.envFile) ? '' : '（不存在，仅用环境变量 / 命令行）'}`);
-  if (config.keyBlocked) {
-    lines.push(
-      `API Key: 未配置 ✗ — 检测到 ${config.keyBlocked.source}，但已拒绝使用：`
-      + `当前地址 ${config.keyBlocked.target} 不是 OpenAI 官方端点，把 openai.com 的凭证发过去等于泄露。`,
-    );
-    lines.push('  → 用当前地址：配该服务自己的 IMAGE_API_KEY；用官方端点：设 IMAGE_API_URL=https://api.openai.com');
-  } else {
-    lines.push(
-      config.key
-        ? `API Key: 已配置（来自${config.keySource}，前 7 位: ${config.key.slice(0, 7)}...）`
-        : 'API Key: 未配置 ✗ — 必填。设置 IMAGE_API_KEY 或写进 <技能目录>/.env',
-    );
-  }
-  lines.push(`配置模型: ${config.modelList.join('、')} (${config.modelList.length} 个，来自${config.modelsSource})`);
-  if (config.modelList.length === 1) {
-    lines.push(`模型策略: 单模型模式（未指定时直接使用 ${config.modelList[0]}，无需询问用户）`);
-  } else {
-    lines.push(`模型策略: 多模型模式（未指定时将列出供用户选择；或通过 --model 显式指定）`);
+  const sourcesInfo = loadSources(flags);
+  const { sources, configDesc } = sourcesInfo;
+
+  let targetSources = sources;
+  if (flags.source) {
+    const query = String(flags.source).trim().toLowerCase();
+    targetSources = sources.filter((s) => s.id.toLowerCase() === query || s.name.toLowerCase() === query);
+    if (targetSources.length === 0) {
+      throw new Fail(`找不到指定的源：${flags.source}`, `当前可用源：${sources.map((s) => s.id).join(', ')}`);
+    }
   }
 
-  if (config.key && major >= 18) {
-    // 实测这台服务 /v1/models 要 6-10 秒、偶发失败，15 秒会把好服务误报成"无法连接"
-    const probeMs = 30000;
-    const modelsUrl = `${apiRoot(config.baseUrl)}/v1/models`;
-    lines.push(`探测端点: ${modelsUrl}（超时 ${probeMs / 1000} 秒，不消耗生图额度）`);
+  lines.push(`配置文件: ${configDesc}`);
+  lines.push(`检测源数: ${targetSources.length} 个（总配置 ${sources.length} 个）`);
 
-    try {
-      const startedAt = Date.now();
-      const resp = await fetch(modelsUrl, {
-        headers: {
-          Authorization: config.key.startsWith('Bearer ') ? config.key : `Bearer ${config.key}`,
-        },
-        signal: AbortSignal.timeout(probeMs),
-      });
-      const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+  const probeMs = 30000;
+  let hasFailure = false;
 
-      if (resp.status === 200) {
-        const data = await resp.json().catch(() => null);
-        const modelList = Array.isArray(data?.data) ? data.data.map((m) => m.id) : [];
-        lines.push(`API 连通性: ✓ 成功连通（/v1/models HTTP 200，${seconds} 秒，共 ${modelList.length} 个模型）`);
-        const imageModels = modelList.filter((id) => /image|dall|flux|paint|banana|seedream|kolors|midjourney|imagen|sdxl|sd3|qwen-?vl|grok-?image/i.test(id));
-        if (imageModels.length) {
-          lines.push(`疑似图像模型 (${imageModels.length} 个): ${imageModels.slice(0, 8).join(', ')}${imageModels.length > 8 ? ' …' : ''}`);
-        } else if (modelList.length) {
-          // 名字里不带 image/dall 这类字样的图像模型（seedream、nano-banana 之类）会漏，所以不下"没有"的结论
-          lines.push(`未按名字识别出图像模型，服务端前几个模型: ${modelList.slice(0, 8).join(', ')}${modelList.length > 8 ? ' …' : ''}`);
-        }
-        for (const m of config.modelList) {
-          if (modelList.includes(m)) {
-            lines.push(`配置模型 [${m}]: ✓ 已在服务可用模型列表中`);
-          } else if (modelList.length > 0) {
-            lines.push(`配置模型 [${m}]: ? 未在服务模型列表中精确匹配（仍可能支持）`);
+  for (let idx = 0; idx < targetSources.length; idx++) {
+    const s = targetSources[idx];
+    const isMulti = targetSources.length > 1;
+    if (isMulti) {
+      lines.push('');
+      lines.push(`==================== [${idx + 1}/${targetSources.length}] 源: [${s.id}] ${s.name}${s.isDefault ? ' (默认源)' : ''} ====================`);
+    } else {
+      lines.push(`源标识: [${s.id}] ${s.name}${s.isDefault ? ' (默认源)' : ''}`);
+    }
+
+    const baseUrl = flags.url ? apiRoot(flags.url) : s.baseUrl;
+    const key = flags.key !== undefined ? String(flags.key).trim() : s.key;
+    const keySource = flags.key !== undefined ? '命令行' : s.keySource;
+    const urlSource = flags.url ? '命令行' : s.urlSource;
+
+    lines.push(`服务 Base URL: ${baseUrl}（来自${urlSource}）`);
+    lines.push(`生图端点: ${buildEndpointUrl(baseUrl, 'generate')}`);
+    lines.push(`修图端点: ${buildEndpointUrl(baseUrl, 'edit')}`);
+
+    lines.push(
+      key
+        ? `API Key: 已配置（来自${keySource}，${maskKey(key)}）`
+        : 'API Key: 未配置 ✗ — 必填。请在配置文件中填入 key',
+    );
+    if (!key) hasFailure = true;
+
+    lines.push(`配置模型: ${s.models.join('、')} (${s.models.length} 个)`);
+
+    if (key && major >= 18) {
+      const modelsUrl = `${apiRoot(baseUrl)}/v1/models`;
+      lines.push(`探测端点: ${modelsUrl}（超时 ${probeMs / 1000} 秒，不消耗生图额度）`);
+
+      try {
+        const startedAt = Date.now();
+        const resp = await fetch(modelsUrl, {
+          headers: {
+            Authorization: key.startsWith('Bearer ') ? key : `Bearer ${key}`,
+          },
+          signal: AbortSignal.timeout(probeMs),
+        });
+        const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+
+        if (resp.status === 200) {
+          const data = await resp.json().catch(() => null);
+          const serverModels = Array.isArray(data?.data) ? data.data.map((m) => m.id) : [];
+          lines.push(`API 连通性: ✓ 成功连通（/v1/models HTTP 200，${seconds} 秒，共 ${serverModels.length} 个模型）`);
+          const imageModels = serverModels.filter((id) => /image|dall|flux|paint|banana|seedream|kolors|midjourney|imagen|sdxl|sd3|qwen-?vl|grok-?image/i.test(id));
+          if (imageModels.length) {
+            lines.push(`疑似图像模型 (${imageModels.length} 个): ${imageModels.slice(0, 8).join(', ')}${imageModels.length > 8 ? ' …' : ''}`);
+          } else if (serverModels.length) {
+            lines.push(`未按名字识别出图像模型，服务端前几个模型: ${serverModels.slice(0, 8).join(', ')}${serverModels.length > 8 ? ' …' : ''}`);
           }
+          for (const m of s.models) {
+            if (serverModels.includes(m)) {
+              lines.push(`配置模型 [${m}]: ✓ 已在服务可用模型列表中`);
+            } else if (serverModels.length > 0) {
+              lines.push(`配置模型 [${m}]: ? 未在服务模型列表中精确匹配（仍可能支持）`);
+            }
+          }
+        } else if (resp.status === 401 || resp.status === 403) {
+          lines.push(`API 连通性: ✗ 认证失败（HTTP ${resp.status}，${seconds} 秒），请检查凭证是否正确有效`);
+          hasFailure = true;
+        } else {
+          lines.push(`API 连通性: ? 端点返回 HTTP ${resp.status}（${seconds} 秒）`);
         }
-      } else if (resp.status === 401 || resp.status === 403) {
-        lines.push(`API 连通性: ✗ 认证失败（HTTP ${resp.status}，${seconds} 秒），请检查凭证是否正确有效`);
-      } else {
-        lines.push(`API 连通性: ? 端点返回 HTTP ${resp.status}（${seconds} 秒）`);
-      }
-    } catch (e) {
-      const chain = causeChain(e);
-      if (/TimeoutError|AbortError/i.test(chain)) {
-        // 超时不等于配置错：这台服务本来就慢且偶发失败，别给出 ✗ 让自检退非零
-        lines.push(`API 连通性: ? ${probeMs / 1000} 秒内没响应 —— 这台服务实测 6-10 秒且偶发失败，可再跑一次；持续如此才是服务侧问题`);
-      } else if (/ENOTFOUND|EAI_AGAIN/i.test(chain)) {
-        lines.push(`API 连通性: ✗ 域名解析不了 —— 检查 IMAGE_API_URL 拼写 (${e.message})`);
-      } else if (/ECONNREFUSED/i.test(chain)) {
-        lines.push(`API 连通性: ✗ 连接被拒 —— 地址或端口不对 (${e.message})`);
-      } else {
-        lines.push(`API 连通性: ✗ 无法连接 (${e.message})`);
+      } catch (e) {
+        const chain = causeChain(e);
+        if (/TimeoutError|AbortError/i.test(chain)) {
+          lines.push(`API 连通性: ? ${probeMs / 1000} 秒内没响应 —— 服务较慢或偶发超时，可再跑一次`);
+        } else if (/ENOTFOUND|EAI_AGAIN/i.test(chain)) {
+          lines.push(`API 连通性: ✗ 域名解析不了 —— 检查接口地址拼写 (${e.message})`);
+          hasFailure = true;
+        } else if (/ECONNREFUSED/i.test(chain)) {
+          lines.push(`API 连通性: ✗ 连接被拒 —— 地址或端口不对 (${e.message})`);
+          hasFailure = true;
+        } else {
+          lines.push(`API 连通性: ✗ 无法连接 (${e.message})`);
+          hasFailure = true;
+        }
       }
     }
   }
 
   console.log(lines.join('\n'));
-  return lines.some((line) => line.includes('✗')) ? 1 : 0;
+  return hasFailure ? 1 : 0;
 }
 
 /**

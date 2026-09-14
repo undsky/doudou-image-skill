@@ -71,20 +71,34 @@ node scripts/edit.mjs photo.png "Draw a potted plant in this area" --mask mask.p
 
 ## ⚙️ Environment Configuration
 
-### 1. Configuration Template (`.env`)
+### 1. Configuration File (`config.json`)
 
-Create a `.env` file in the project root or the skill installation directory:
+Copy `config.json.example` in the skill root or project root to `config.json`, and configure your providers and credentials:
 
-```env
-# Image Model API Key (Required)
-DOUDOU_IMAGE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-# Image Service Base URL (Required)
-DOUDOU_IMAGE_API_URL=https://your-api-endpoint.com
-
-# Default Model List (Optional, comma-separated)
-DOUDOU_IMAGE_API_MODELS=gpt-image-2,gpt-image-2-2k,dall-e-3
+```json
+{
+  "default_source": "qkmss",
+  "sources": [
+    {
+      "id": "qkmss",
+      "name": "Qkmss (Default)",
+      "url": "https://qkmss.com",
+      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "models": ["gpt-image-2", "gpt-image-2.5"]
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI Official",
+      "url": "https://api.openai.com",
+      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "models": ["dall-e-3"]
+    }
+  ]
+}
 ```
+
+- **Source Switching**: Switch API sources using `--source <id>`, or let `--model <name>` automatically route to the matching source.
+- **Config Path**: The script automatically checks `config.json`, or you can specify a custom path via `DOUDOU_IMAGE_CONFIG_FILE=/path/to/config.json`.
 
 ### 2. Environment & Connectivity Doctor
 
