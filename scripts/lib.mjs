@@ -169,11 +169,11 @@ export function resolveConfig(flags, endpoint) {
     return { value: '', source: '', envKey: '' };
   };
 
-  const rawUrl = pick(flags.url, 'IMAGE_API_URL', 'DOUDOU_IMAGE_API_URL', 'DOUDOU_API_URL', 'OPENAI_BASE_URL');
-  const rawKey = pick(flags.key, 'IMAGE_API_KEY', 'DOUDOU_IMAGE_API_KEY', 'DOUDOU_API_KEY', 'OPENAI_API_KEY');
+  const rawUrl = pick(flags.url, 'DOUDOU_IMAGE_API_URL', 'IMAGE_API_URL', 'DOUDOU_API_URL', 'OPENAI_BASE_URL');
+  const rawKey = pick(flags.key, 'DOUDOU_IMAGE_API_KEY', 'IMAGE_API_KEY', 'DOUDOU_API_KEY', 'OPENAI_API_KEY');
   // 模型列表只从环境变量 / .env 取：命令行侧 --models 是"列出清单"的布尔开关，
   // 而单次覆盖用 --model（由 resolveModel 处理），没有"命令行传整个清单"这回事。
-  const models = pick(undefined, 'IMAGE_API_MODELS', 'IMAGE_API_MODEL', 'DOUDOU_IMAGE_MODELS', 'DOUDOU_IMAGE_MODEL', 'IMAGE_MODEL');
+  const models = pick(undefined, 'DOUDOU_IMAGE_API_MODELS', 'IMAGE_API_MODELS', 'DOUDOU_IMAGE_MODELS', 'IMAGE_API_MODEL', 'DOUDOU_IMAGE_MODEL', 'IMAGE_MODEL');
 
   const baseUrl = apiRoot(rawUrl.value);
   const url = buildEndpointUrl(baseUrl, endpoint);

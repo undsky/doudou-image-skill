@@ -155,15 +155,15 @@ node scripts/edit.mjs photo.png '把这块区域画成一盆绿植' --mask mask.
 
 | 配置项 | `.env` 键名 | 命令行 | 必需性 |
 |---|---|---|---|
-| 服务地址 | `IMAGE_API_URL` | `--url` | 可省，默认值以 `scripts/lib.mjs` 的 `DEFAULT_BASE_URL` 为准（`--doctor` 会打印实际取值）。填服务根地址即可，端点路径由脚本拼 |
-| 访问凭证 | `IMAGE_API_KEY` | `--key` | **必填**，`sk-...` 格式 |
-| 可用模型列表 | `IMAGE_API_MODELS` | `--model` | 多个逗号分隔，未指明且多模型时供选择 |
+| 服务地址 | `DOUDOU_IMAGE_API_URL`（兼容 `IMAGE_API_URL`） | `--url` | **必填**，填服务根地址即可，端点路径由脚本拼 |
+| 访问凭证 | `DOUDOU_IMAGE_API_KEY`（兼容 `IMAGE_API_KEY`） | `--key` | **必填**，`sk-...` 格式 |
+| 可用模型列表 | `DOUDOU_IMAGE_API_MODELS`（兼容 `IMAGE_API_MODELS`） | `--model` | 多个逗号分隔，未指明且多模型时供选择 |
 
 > [!WARNING]
 > **`$OPENAI_API_KEY` 只在服务地址确实是 OpenAI 官方时才会被采用。** 它通常是 openai.com 的
 > 真凭证，发去中转站 / 自建网关等于泄露 —— 所以脚本按地址的 host 判断：不是 `api.openai.com`
-> 就拦住并说明。要么把该服务自己的凭证写成 `IMAGE_API_KEY`，要么把地址设成
-> `IMAGE_API_URL=https://api.openai.com`（此时才认 `$OPENAI_API_KEY`）。
+> 就拦住并说明。要么把该服务自己的凭证写成 `DOUDOU_IMAGE_API_KEY`，要么把地址设成
+> `DOUDOU_IMAGE_API_URL=https://api.openai.com`（此时才认 `$OPENAI_API_KEY`）。
 
 配置类问题先跑自检（探连通性与可用模型，不耗生图配额）：
 
