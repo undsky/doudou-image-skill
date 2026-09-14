@@ -77,21 +77,21 @@ Copy `config.json.example` in the skill root or project root to `config.json`, a
 
 ```json
 {
-  "default_source": "qkmss",
+  "default_source": "openai",
   "sources": [
-    {
-      "id": "qkmss",
-      "name": "Qkmss (Default)",
-      "url": "https://qkmss.com",
-      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-      "models": ["gpt-image-2", "gpt-image-2.5"]
-    },
     {
       "id": "openai",
       "name": "OpenAI Official",
       "url": "https://api.openai.com",
       "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-      "models": ["dall-e-3"]
+      "models": ["dall-e-3", "dall-e-2"]
+    },
+    {
+      "id": "custom",
+      "name": "Third-Party / Custom New API",
+      "url": "https://api.example.com",
+      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "models": ["gpt-image-2", "gpt-image-2.5"]
     }
   ]
 }

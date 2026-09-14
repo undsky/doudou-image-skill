@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 
 export const SKILL_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-export const DEFAULT_BASE_URL = 'https://qkmss.com';
+export const DEFAULT_BASE_URL = 'https://api.openai.com';
 export const DEFAULT_MODEL = 'gpt-image-2';
 export const ENDPOINTS = { generate: '/v1/images/generations', edit: '/v1/images/edits' };
 export const MAX_IMAGE_BYTES = 4 * 1024 * 1024;

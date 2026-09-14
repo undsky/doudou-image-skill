@@ -162,21 +162,21 @@ node scripts/edit.mjs photo.png '把这块区域画成一盆绿植' --mask mask.
 
 ```json
 {
-  "default_source": "qkmss",
+  "default_source": "openai",
   "sources": [
-    {
-      "id": "qkmss",
-      "name": "Qkmss (默认源)",
-      "url": "https://qkmss.com",
-      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-      "models": ["gpt-image-2", "gpt-image-2.5"]
-    },
     {
       "id": "openai",
       "name": "OpenAI 官方",
       "url": "https://api.openai.com",
       "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-      "models": ["dall-e-3"]
+      "models": ["dall-e-3", "dall-e-2"]
+    },
+    {
+      "id": "custom",
+      "name": "第三方 / 自建 New API",
+      "url": "https://api.example.com",
+      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "models": ["gpt-image-2", "gpt-image-2.5"]
     }
   ]
 }
