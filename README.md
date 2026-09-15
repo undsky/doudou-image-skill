@@ -85,9 +85,6 @@ npx skills add undsky/doudou-image-skill --yes
 }
 ```
 
-- **多源切换**：可通过 `--source <id>` 指定 API 源，或通过 `--model <name>` 自动智能路由。
-- **配置路径**：脚本会自动查找 `config.json`，亦可通过环境变量 `DOUDOU_IMAGE_CONFIG_FILE` 指定。
-
 ### 2. 环境与连通性自检
 
 运行自检命令检查凭据有效性与模型连通性（不消耗生图额度）：

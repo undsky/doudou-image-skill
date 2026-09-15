@@ -240,8 +240,6 @@ export function loadSources(flags = {}) {
   }
 
   let sources = [];
-  let defaultSourceId = '';
-  let preferLastSuccess = true;
   const configDesc = `${basename(configFilePath)} (${configFilePath})`;
 
   try {
@@ -255,14 +253,7 @@ export function loadSources(flags = {}) {
         keySource: `${basename(configFilePath)}`,
       }));
     } else if (parsed && typeof parsed === 'object') {
-      if (parsed.prefer_last_success !== undefined) {
-        preferLastSuccess = Boolean(parsed.prefer_last_success);
-      } else if (parsed.preferLastSuccess !== undefined) {
-        preferLastSuccess = Boolean(parsed.preferLastSuccess);
-      } else if (parsed.cache_last_success !== undefined) {
-        preferLastSuccess = Boolean(parsed.cache_last_success);
-      }
-      defaultSourceId = String(parsed.default_source || parsed.defaultSource || '').trim();
+      // prefer_last_success 始终启用，不再从配置读取
       const rawList = Array.isArray(parsed.sources)
         ? parsed.sources
         : (parsed.sources && typeof parsed.sources === 'object'
@@ -270,7 +261,7 @@ export function loadSources(flags = {}) {
             : []);
       sources = rawList.map((item, idx) => new ApiSource({
         ...item,
-        isDefault: defaultSourceId ? item.id === defaultSourceId : Boolean(item.default || item.isDefault || idx === 0),
+        isDefault: Boolean(item.default || item.isDefault || idx === 0),
         configSource: `${basename(configFilePath)} [${item.id || idx + 1}]`,
         keySource: `${basename(configFilePath)}`,
       }));
@@ -295,8 +286,8 @@ export function loadSources(flags = {}) {
 
   const defaultSource = sources.find((s) => s.isDefault) || sources[0];
 
-  // 读取缓存中上次成功的源，并判断是否可作为首选源（自动读取 scripts 脚本目录下的缓存）
-  const cachedSourceId = preferLastSuccess ? loadLastSuccessSource() : null;
+  // prefer_last_success 始终启用：读取缓存中上次成功的源作为首选
+  const cachedSourceId = loadLastSuccessSource();
   const cachedSource = cachedSourceId ? sources.find((s) => s.id === cachedSourceId) : null;
   const preferredSource = cachedSource || defaultSource;
   const lastSuccessSourceId = cachedSource ? cachedSource.id : null;
@@ -306,7 +297,7 @@ export function loadSources(flags = {}) {
     defaultSource,
     preferredSource,
     lastSuccessSourceId,
-    preferLastSuccess,
+    preferLastSuccess: true,
     configDesc,
     configFile: configFilePath,
   };
@@ -961,7 +952,7 @@ export async function readImageFile(path, label) {
   if (stats.size > MAX_IMAGE_BYTES) {
     throw new Fail(
       `${label} ${humanBytes(stats.size)}，超过 ${humanBytes(MAX_IMAGE_BYTES)} 上限`,
-      '先缩小再传，例如 magick 原图 -resize 1024x1024 小图.png',
+      `先用 ImageMagick 缩小再传：magick 原图 -resize 1024x1024 小图.png\n${getImageMagickInstallGuide()}`,
     );
   }
   const buffer = readFileSync(path);
@@ -1034,12 +1025,31 @@ export function checkMask(mask, image) {
     if (imgInfo.width !== maskInfo.width || imgInfo.height !== maskInfo.height) {
       throw new Fail(
         `mask 尺寸必须和原图一致：原图 ${imgInfo.width}x${imgInfo.height}，mask ${maskInfo.width}x${maskInfo.height}`,
-        '按原图尺寸重做 mask，例如 magick mask.png -resize ' + `${imgInfo.width}x${imgInfo.height}! mask-fixed.png`,
+        `按原图尺寸重做 mask：magick mask.png -resize ${imgInfo.width}x${imgInfo.height}! mask-fixed.png\n${getImageMagickInstallGuide()}`,
       );
     }
     return { checkedSize: true, width: imgInfo.width, height: imgInfo.height };
   }
   return { checkedSize: false, width: maskInfo.width, height: maskInfo.height };
+}
+
+// ---- ImageMagick 检测与安装指引 ----
+
+export function getImageMagickInstallGuide() {
+  return `
+💡 ImageMagick 安装指南：
+  • Windows:
+      winget install ImageMagick.ImageMagick
+      或: choco install imagemagick
+      官网下载包: https://imagemagick.org/script/download.php#windows
+  • macOS:
+      brew install imagemagick
+  • Linux (Ubuntu/Debian):
+      sudo apt update && sudo apt install -y imagemagick
+  • Linux (Fedora/RHEL/CentOS):
+      sudo dnf install -y ImageMagick
+
+注意：安装后请重启终端以确保环境变量生效。`;
 }
 
 // ---- 参数解析 ----
