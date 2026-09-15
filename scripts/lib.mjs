@@ -18,6 +18,10 @@ export const DEFAULT_BASE_URL = 'https://api.openai.com';
 export const DEFAULT_MODEL = 'gpt-image-2';
 export const ENDPOINTS = { generate: '/v1/images/generations', edit: '/v1/images/edits' };
 export const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+// 下载产物的体积上限，故意远比 MAX_IMAGE_BYTES 宽松：后者是编辑接口的「上传」上限，
+// 而上游出的 2K / 4K 图本身就可能十几 MB，拿 4MB 去卡会把正常产物误杀。
+// 这道闸只为兜住异常响应（上游故障回一个巨型 body），避免无上界地读进内存。
+export const MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024;
 
 // size 的实情（据 docs.newapi.pro 的 images 接口文档 + 实测）：
 //   生成接口只列 1024x1024 / 1536x1024 / 1024x1536 / auto（gpt-image-1 系）；
@@ -80,9 +84,32 @@ export class Fail extends Error {
 
 export const CONFIG_FILE_NAME = 'config.json';
 
+/** config.json 向上查找的层级数（含起始目录自身） */
+export const CONFIG_LOOKUP_LEVELS = 4;
+
+/** 从 startDir 起向上收集存在的 config.json 路径（由近到远） */
+function collectConfigChain(startDir) {
+  const chain = [];
+  let curr = resolve(startDir);
+  for (let i = 0; i < CONFIG_LOOKUP_LEVELS; i += 1) {
+    const candidate = join(curr, CONFIG_FILE_NAME);
+    if (existsSync(candidate)) chain.push(resolve(candidate));
+    const parent = resolve(curr, '..');
+    if (parent === curr) break;
+    curr = parent;
+  }
+  return chain;
+}
+
 /**
- * 查找配置文件 config.json。
- * 优先检查 customPath，其次检查技能目录，再向上查找项目根。
+ * 查找配置文件 config.json：
+ * 1. 显式指定的 customPath 优先（先相对 cwd，再相对技能目录）；
+ * 2. 项目工作目录链上第一个非技能自带的 config.json（项目级配置优先于技能默认配置）；
+ * 3. 技能目录自身，再沿技能目录向上（兼容挂载在 <project>/.agents/skills/ 等场景）。
+ *
+ * 不用 ROOT_MARKERS 提前 break：技能目录自身通常就是个 git 仓库（带 .git），
+ * 一判就中、循环第一轮就退出，父级的 config.json 永远轮不到检查。
+ * 边界改由 CONFIG_LOOKUP_LEVELS 控制，与 doudou-cdn-skill 的 .env 查找口径一致。
  */
 export function findConfigFile(customPath) {
   if (customPath) {
@@ -93,49 +120,31 @@ export function findConfigFile(customPath) {
     throw new Fail(`指定的配置文件不存在：${customPath}`, '请检查文件路径是否正确');
   }
 
-  // 1. 优先在技能目录下找
-  const inSkill = join(SKILL_DIR, CONFIG_FILE_NAME);
-  if (existsSync(inSkill)) return inSkill;
+  const skillConfig = resolve(join(SKILL_DIR, CONFIG_FILE_NAME));
 
-  // 2. 向上找项目根（最多 3 级）
-  let curr = SKILL_DIR;
-  for (let i = 0; i < 3; i += 1) {
-    const isRoot = ROOT_MARKERS.some((m) => existsSync(join(curr, m)));
-    if (isRoot) break;
-    const parent = resolve(curr, '..');
-    if (parent === curr) break;
-    curr = parent;
-    const inParent = join(curr, CONFIG_FILE_NAME);
-    if (existsSync(inParent)) return inParent;
+  // 项目工作目录链：排除技能自带的那份，避免把技能默认配置当成项目配置
+  for (const candidate of collectConfigChain(process.cwd())) {
+    if (candidate !== skillConfig) return candidate;
   }
+
+  // 技能目录自身，再沿技能目录向上
+  const skillChain = collectConfigChain(SKILL_DIR);
+  if (skillChain.length) return skillChain[0];
+
   return null;
 }
 
 export const CACHE_FILE_NAME = '.cache.json';
 
-/** 获取缓存文件路径（自动保存在脚本目录下） */
-export function getCacheFilePath(customDir) {
-  let dir = SCRIPTS_DIR;
-  if (customDir) {
-    try {
-      if (existsSync(customDir) && statSync(customDir).isDirectory()) {
-        dir = customDir;
-      } else if (extname(customDir)) {
-        dir = dirname(customDir);
-      } else {
-        dir = customDir;
-      }
-    } catch {
-      dir = customDir;
-    }
-  }
-  return join(dir, CACHE_FILE_NAME);
+/** 获取缓存文件路径（固定在脚本目录下） */
+export function getCacheFilePath() {
+  return join(SCRIPTS_DIR, CACHE_FILE_NAME);
 }
 
 /** 读取缓存中上次成功的源 ID */
-export function loadLastSuccessSource(customDir) {
+export function loadLastSuccessSource() {
   try {
-    const cachePath = getCacheFilePath(customDir);
+    const cachePath = getCacheFilePath();
     if (!existsSync(cachePath)) return null;
     const content = readFileSync(cachePath, 'utf8');
     const data = JSON.parse(content);
@@ -148,11 +157,11 @@ export function loadLastSuccessSource(customDir) {
   return null;
 }
 
-/** 记录上次成功的源 ID 到本地缓存文件（默认在脚本目录下） */
-export function recordLastSuccessSource(sourceId, customDir) {
+/** 记录上次成功的源 ID 到本地缓存文件（脚本目录下） */
+export function recordLastSuccessSource(sourceId) {
   if (!sourceId) return;
   try {
-    const cachePath = getCacheFilePath(customDir);
+    const cachePath = getCacheFilePath();
     const payload = {
       last_successful_source: String(sourceId).trim(),
       updated_at: new Date().toISOString(),
@@ -160,18 +169,6 @@ export function recordLastSuccessSource(sourceId, customDir) {
     writeFileSync(cachePath, JSON.stringify(payload, null, 2) + '\n', 'utf8');
   } catch {
     // 写入异常不影响主业务逻辑
-  }
-}
-
-/** 清空上次成功的源缓存 */
-export function clearLastSuccessSource(customDir) {
-  try {
-    const cachePath = getCacheFilePath(customDir);
-    if (existsSync(cachePath)) {
-      writeFileSync(cachePath, JSON.stringify({}, null, 2) + '\n', 'utf8');
-    }
-  } catch {
-    // ignore
   }
 }
 
@@ -231,7 +228,7 @@ export class ApiSource {
  * 找不到配置文件时抛出 Fail 错误，提示用户创建。
  */
 export function loadSources(flags = {}) {
-  const customConfigPath = flags.configFile || process.env.DOUDOU_IMAGE_CONFIG_FILE;
+  const customConfigPath = process.env.DOUDOU_IMAGE_CONFIG_FILE;
   const configFilePath = findConfigFile(customConfigPath);
 
   if (!configFilePath) {
@@ -299,7 +296,7 @@ export function loadSources(flags = {}) {
   const defaultSource = sources.find((s) => s.isDefault) || sources[0];
 
   // 读取缓存中上次成功的源，并判断是否可作为首选源（自动读取 scripts 脚本目录下的缓存）
-  const cachedSourceId = preferLastSuccess ? loadLastSuccessSource(flags.cacheDir) : null;
+  const cachedSourceId = preferLastSuccess ? loadLastSuccessSource() : null;
   const cachedSource = cachedSourceId ? sources.find((s) => s.id === cachedSourceId) : null;
   const preferredSource = cachedSource || defaultSource;
   const lastSuccessSourceId = cachedSource ? cachedSource.id : null;
@@ -750,8 +747,20 @@ export function explain(status, json, config, notes = {}) {
   // 让人白等一轮又一轮。
   const looksLikeModelMissing = /model_not_found|无可用渠道|no available channel/i.test(`${code} ${message}`);
 
+  // 两个脚本都写死发 response_format=b64_json。真 OpenAI 的 gpt-image-1 系列已移除这个
+  // 参数，收到会回 "Unknown parameter: 'response_format'" 之类的 400。这既不是提示词
+  // 问题也不是尺寸问题，单独点出来，否则只会照着通用建议白排查一轮。
+  const looksLikeResponseFormat = /response_format/i.test(`${code} ${type} ${message}`);
+
   const hints = [];
-  if (looksLikeModelMissing) {
+  if (looksLikeResponseFormat) {
+    hints.push(
+      '上游不认 response_format 参数（不是提示词或尺寸的问题）：脚本写死发 b64_json，'
+      + '要求直接返回图片数据、不走 URL 下载，而真 OpenAI 的 gpt-image-1 系列已移除该参数。'
+      + `\n换一个接受它的模型或渠道（--models 看本地配了哪些，--doctor 看服务端有哪些），`
+      + '或去掉脚本里写死的 response_format。',
+    );
+  } else if (looksLikeModelMissing) {
     hints.push(
       `模型不可用（不是上游抖动，重试不会好）：当前分组下 [${notes.model || '所选模型'}] 没有可用渠道。`
       + `\n换一个模型（--model <名字>），或在服务商后台为该模型开渠道。`
@@ -775,6 +784,45 @@ export function explain(status, json, config, notes = {}) {
   }
 
   return new Fail(parts.join('\n'), hints.join('\n'));
+}
+
+/**
+ * 按上限读响应体，超限立即中止。
+ *
+ * 不能先 arrayBuffer() 再判长度 —— 那时内存已经吃满了，检查等于没做。
+ * 这里先看 Content-Length 提前拦掉；没有这个头（分块传输）就边读边累计，
+ * 一超限就 cancel 掉 reader，连接随之断开，不会把剩下的字节继续拉完。
+ */
+async function readBodyCapped(resp, maxBytes, label, hint) {
+  const tooBig = (bytes) => new Fail(
+    `${label} ${humanBytes(bytes)}，超过 ${humanBytes(maxBytes)} 上限`,
+    hint,
+  );
+
+  const declared = Number(resp.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) throw tooBig(declared);
+
+  if (!resp.body) {
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    if (buffer.length > maxBytes) throw tooBig(buffer.length);
+    return buffer;
+  }
+
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) throw tooBig(total);
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return Buffer.concat(chunks, total);
 }
 
 /** 解析上游返回的单条图片数据（兼容 b64_json 与 url 两种形态） */
@@ -802,8 +850,12 @@ export async function parseImageData(item) {
     if (!resp.ok) {
       throw new Fail(`下载上游图片返回 HTTP ${resp.status}：${item.url}`);
     }
-    const arrayBuffer = await resp.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    const buffer = await readBodyCapped(
+      resp,
+      MAX_DOWNLOAD_BYTES,
+      '上游返回的图片',
+      `${item.url}\n返回的内容异常地大，已中止下载。可换 --model 或稍后重试`,
+    );
     const mime = sniffMime(buffer) || 'image/png';
     // 不再顺手转一份 base64：落盘只用 buffer，多张大图时这份字符串纯属白占内存
     return {
@@ -931,15 +983,15 @@ export async function fetchRemoteImage(url) {
   if (!resp.ok) {
     throw new Fail(`下载待编辑的图片返回 HTTP ${resp.status}：${url}`);
   }
-  const buffer = Buffer.from(await resp.arrayBuffer());
+  // 走 readBodyCapped 而不是先 arrayBuffer() 再判长度：后者在超限时内存已经吃满了
+  const buffer = await readBodyCapped(
+    resp,
+    MAX_IMAGE_BYTES,
+    '待编辑图片',
+    '请先缩小再传，或使用本地小尺寸图片',
+  );
   if (buffer.length === 0) {
     throw new Fail(`下载的文件是空内容：${url}`);
-  }
-  if (buffer.length > MAX_IMAGE_BYTES) {
-    throw new Fail(
-      `待编辑图片 ${humanBytes(buffer.length)}，超过 ${humanBytes(MAX_IMAGE_BYTES)} 上限`,
-      '请先缩小再传，或使用本地小尺寸图片',
-    );
   }
   const mime = sniffMime(buffer);
   if (!mime) {
@@ -1096,6 +1148,7 @@ export async function doctor(flags) {
   lines.push(`检测源数: ${targetSources.length} 个（总配置 ${sources.length} 个）`);
 
   const probeMs = 30000;
+  const isMulti = targetSources.length > 1;
   let hasFailure = false;
 
   for (let idx = 0; idx < targetSources.length; idx++) {

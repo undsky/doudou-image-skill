@@ -139,6 +139,8 @@ async function main() {
   form.append('prompt', prompt);
   form.append('model', model);
   form.append('n', String(n));
+  // 与 generate.mjs 口径一致：写死要求直接返回图片数据，不走 URL 下载
+  form.append('response_format', 'b64_json');
   if (size) form.append('size', size);
 
   const startedAt = Date.now();
@@ -159,7 +161,7 @@ async function main() {
 
   const stem = remote ? safeStem(prompt) : `${safeStem(basename(image.path).replace(/\.[a-z0-9]+$/i, ''), 16)}-edit`;
   const saved = await saveImages(images, flags, stem);
-  recordLastSuccessSource(config.source.id, flags.cacheDir);
+  recordLastSuccessSource(config.source.id);
   info(`完成：${saved.length} 张，源 [${config.source.id}]，模型 ${model}，耗时 ${seconds} 秒`);
 
   if (flags.json) {

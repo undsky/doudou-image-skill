@@ -104,10 +104,12 @@ async function main() {
   requireKey(config);
   const model = await resolveModel(flags, config.modelList, config.source?.name);
 
-  // 只发文档里列出的字段。生成接口的参数表没有 response_format —— 真 OpenAI 的
-  // gpt-image-1 收到它会回 400，而 b64_json / url 两种返回 parseImageData 都能吃，
-  // 所以不必指定。
-  const body = { prompt, model, n };
+  // 写死 response_format=b64_json：要求上游把图片数据直接放在响应里，不给临时 URL。
+  // 好处是省掉第二趟 HTTP，也绕开了 URL 那条路的失败模式（链接过期、本地网络访问不到
+  // 上游的 CDN、下载中途断流）。
+  // 代价：真 OpenAI 的 gpt-image-1 系列已移除这个参数，收到会回 400 —— 那种情况由
+  // lib.mjs 的 explain() 单独翻译成人话。
+  const body = { prompt, model, n, response_format: 'b64_json' };
   if (size) body.size = size;
 
   info(`生成中：${n} 张${size ? ` ${size}` : ''}，${prompt.length} 字提示词，源 [${config.source.id}]，模型 ${model}`);
@@ -132,7 +134,7 @@ async function main() {
   if (!images.length) throw new Fail('上游接口返回成功但未包含图片数据', JSON.stringify(json).slice(0, 300));
 
   const saved = await saveImages(images, flags, safeStem(prompt));
-  recordLastSuccessSource(config.source.id, flags.cacheDir);
+  recordLastSuccessSource(config.source.id);
   info(`完成：${saved.length} 张，源 [${config.source.id}]，模型 ${model}，耗时 ${seconds} 秒`);
 
   if (flags.json) {
