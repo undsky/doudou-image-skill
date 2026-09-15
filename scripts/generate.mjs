@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import {
   Fail, KNOWN_GOOD_SIZE, checkPrompt, doctor, explain, formatModelsOutput, formatSourcesOutput,
   humanBytes, info, loadSources, parseArgs, parseCount, parseImageData, parseSizeArg, parseTimeout,
-  post, requireKey, resolveConfig, resolveModel, run, safeStem, saveImages,
+  post, recordLastSuccessSource, requireKey, resolveConfig, resolveModel, run, safeStem, saveImages,
 } from './lib.mjs';
 
 const DEFAULT_TIMEOUT_MS = 300000;
@@ -132,6 +132,7 @@ async function main() {
   if (!images.length) throw new Fail('上游接口返回成功但未包含图片数据', JSON.stringify(json).slice(0, 300));
 
   const saved = await saveImages(images, flags, safeStem(prompt));
+  recordLastSuccessSource(config.source.id, flags.cacheDir);
   info(`完成：${saved.length} 张，源 [${config.source.id}]，模型 ${model}，耗时 ${seconds} 秒`);
 
   if (flags.json) {

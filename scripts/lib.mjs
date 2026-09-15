@@ -7,12 +7,13 @@
 // Node 18+ 自带 fetch / FormData / Blob，无任何第三方依赖。
 
 import { stat, mkdir, writeFile } from 'node:fs/promises';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 
-export const SKILL_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+export const SCRIPTS_DIR = dirname(fileURLToPath(import.meta.url));
+export const SKILL_DIR = resolve(SCRIPTS_DIR, '..');
 export const DEFAULT_BASE_URL = 'https://api.openai.com';
 export const DEFAULT_MODEL = 'gpt-image-2';
 export const ENDPOINTS = { generate: '/v1/images/generations', edit: '/v1/images/edits' };
@@ -110,6 +111,70 @@ export function findConfigFile(customPath) {
   return null;
 }
 
+export const CACHE_FILE_NAME = '.cache.json';
+
+/** 获取缓存文件路径（自动保存在脚本目录下） */
+export function getCacheFilePath(customDir) {
+  let dir = SCRIPTS_DIR;
+  if (customDir) {
+    try {
+      if (existsSync(customDir) && statSync(customDir).isDirectory()) {
+        dir = customDir;
+      } else if (extname(customDir)) {
+        dir = dirname(customDir);
+      } else {
+        dir = customDir;
+      }
+    } catch {
+      dir = customDir;
+    }
+  }
+  return join(dir, CACHE_FILE_NAME);
+}
+
+/** 读取缓存中上次成功的源 ID */
+export function loadLastSuccessSource(customDir) {
+  try {
+    const cachePath = getCacheFilePath(customDir);
+    if (!existsSync(cachePath)) return null;
+    const content = readFileSync(cachePath, 'utf8');
+    const data = JSON.parse(content);
+    if (data && typeof data === 'object' && typeof data.last_successful_source === 'string') {
+      return data.last_successful_source.trim() || null;
+    }
+  } catch {
+    // 缓存文件损坏或无权限时不阻断正常流程
+  }
+  return null;
+}
+
+/** 记录上次成功的源 ID 到本地缓存文件（默认在脚本目录下） */
+export function recordLastSuccessSource(sourceId, customDir) {
+  if (!sourceId) return;
+  try {
+    const cachePath = getCacheFilePath(customDir);
+    const payload = {
+      last_successful_source: String(sourceId).trim(),
+      updated_at: new Date().toISOString(),
+    };
+    writeFileSync(cachePath, JSON.stringify(payload, null, 2) + '\n', 'utf8');
+  } catch {
+    // 写入异常不影响主业务逻辑
+  }
+}
+
+/** 清空上次成功的源缓存 */
+export function clearLastSuccessSource(customDir) {
+  try {
+    const cachePath = getCacheFilePath(customDir);
+    if (existsSync(cachePath)) {
+      writeFileSync(cachePath, JSON.stringify({}, null, 2) + '\n', 'utf8');
+    }
+  } catch {
+    // ignore
+  }
+}
+
 /** 脱敏打印 Key */
 export function maskKey(key) {
   if (!key) return '（未配置）';
@@ -179,6 +244,7 @@ export function loadSources(flags = {}) {
 
   let sources = [];
   let defaultSourceId = '';
+  let preferLastSuccess = true;
   const configDesc = `${basename(configFilePath)} (${configFilePath})`;
 
   try {
@@ -192,6 +258,13 @@ export function loadSources(flags = {}) {
         keySource: `${basename(configFilePath)}`,
       }));
     } else if (parsed && typeof parsed === 'object') {
+      if (parsed.prefer_last_success !== undefined) {
+        preferLastSuccess = Boolean(parsed.prefer_last_success);
+      } else if (parsed.preferLastSuccess !== undefined) {
+        preferLastSuccess = Boolean(parsed.preferLastSuccess);
+      } else if (parsed.cache_last_success !== undefined) {
+        preferLastSuccess = Boolean(parsed.cache_last_success);
+      }
       defaultSourceId = String(parsed.default_source || parsed.defaultSource || '').trim();
       const rawList = Array.isArray(parsed.sources)
         ? parsed.sources
@@ -225,9 +298,18 @@ export function loadSources(flags = {}) {
 
   const defaultSource = sources.find((s) => s.isDefault) || sources[0];
 
+  // 读取缓存中上次成功的源，并判断是否可作为首选源（自动读取 scripts 脚本目录下的缓存）
+  const cachedSourceId = preferLastSuccess ? loadLastSuccessSource(flags.cacheDir) : null;
+  const cachedSource = cachedSourceId ? sources.find((s) => s.id === cachedSourceId) : null;
+  const preferredSource = cachedSource || defaultSource;
+  const lastSuccessSourceId = cachedSource ? cachedSource.id : null;
+
   return {
     sources,
     defaultSource,
+    preferredSource,
+    lastSuccessSourceId,
+    preferLastSuccess,
     configDesc,
     configFile: configFilePath,
   };
@@ -237,7 +319,8 @@ export function loadSources(flags = {}) {
  * 根据命令行选项与模型智能匹配当前所用的源
  */
 export async function resolveSource(flags, sourcesInfo) {
-  const { sources, defaultSource } = sourcesInfo;
+  const { sources, defaultSource, preferredSource, lastSuccessSourceId } = sourcesInfo;
+  const activeFallback = preferredSource || defaultSource;
 
   // 1. 命令行显式指定了 --source
   if (flags.source) {
@@ -246,7 +329,7 @@ export async function resolveSource(flags, sourcesInfo) {
     if (!matched) {
       throw new Fail(
         `找不到指定的源：${flags.source}`,
-        `当前配置的可用源：\n${sources.map((s, i) => `  ${i + 1}. [${s.id}] ${s.name}${s.isDefault ? ' (默认)' : ''}`).join('\n')}\n使用 --sources 查看完整列表。`,
+        `当前配置的可用源：\n${sources.map((s, i) => `  ${i + 1}. [${s.id}] ${s.name}${s.id === lastSuccessSourceId ? ' (首选: 上次成功)' : (s.isDefault ? ' (默认)' : '')}`).join('\n')}\n使用 --sources 查看完整列表。`,
       );
     }
     return matched;
@@ -261,15 +344,19 @@ export async function resolveSource(flags, sourcesInfo) {
       return candidates[0];
     }
     if (candidates.length > 1) {
-      // 多个源均支持：优先选默认源（如果默认源支持）
+      // 多个源均支持：优先选首选源（若首选源支持），其次选默认源（若默认源支持）
+      if (candidates.some((s) => s.id === activeFallback.id)) {
+        return activeFallback;
+      }
       if (candidates.some((s) => s.id === defaultSource.id)) {
         return defaultSource;
       }
-      // 默认源不在其中且是交互式终端：提示用户选择源
+      // 默认源/首选源都不在候选列表中且是交互式终端：提示用户选择源
       if (process.stdin.isTTY) {
         info(`检测到模型 [${targetModel}] 存在于多个源中，请选择使用的源（直接回车默认第 1 项）：`);
         for (let i = 0; i < candidates.length; i++) {
-          info(`  ${i + 1}) [${candidates[i].id}] ${candidates[i].name}`);
+          const tag = candidates[i].id === lastSuccessSourceId ? ' (首选: 上次成功)' : (candidates[i].isDefault ? ' (默认)' : '');
+          info(`  ${i + 1}) [${candidates[i].id}] ${candidates[i].name}${tag}`);
         }
         const rl = createInterface({ input: process.stdin, output: process.stderr });
         try {
@@ -287,8 +374,8 @@ export async function resolveSource(flags, sourcesInfo) {
       info(`注意：模型 [${targetModel}] 存在于多个源中，已默认选用 [${candidates[0].id}]（可用 --source <id> 显式指定）`);
       return candidates[0];
     }
-    // 未在任何源的模型列表中匹配（可能是用户直接指定的外部模型）：回退到默认源
-    return defaultSource;
+    // 未在任何源的模型列表中匹配（可能是用户直接指定的外部模型）：回退到首选源
+    return activeFallback;
   }
 
   // 3. 既未传 --source 也未传 --model
@@ -297,27 +384,34 @@ export async function resolveSource(flags, sourcesInfo) {
     return sources[0];
   }
 
-  // 多个源：在交互式终端且没有明确单选时，询问用户选择源；若未交互则使用默认源
+  // 多个源：在交互式终端且没有明确单选时，询问用户选择源；若未交互则使用首选源
   if (process.stdin.isTTY && !flags.source) {
-    info(`当前配置了 ${sources.length} 个可用源，请选择（直接回车默认使用 [${defaultSource.id}] ${defaultSource.name}）：`);
+    const preferredDesc = activeFallback.id === lastSuccessSourceId
+      ? `[${activeFallback.id}] ${activeFallback.name} (首选: 上次成功)`
+      : `[${activeFallback.id}] ${activeFallback.name}${activeFallback.isDefault ? ' (默认)' : ''}`;
+    info(`当前配置了 ${sources.length} 个可用源，请选择（直接回车默认使用 ${preferredDesc}）：`);
     for (let i = 0; i < sources.length; i++) {
-      info(`  ${i + 1}) [${sources[i].id}] ${sources[i].name}${sources[i].isDefault ? ' (默认)' : ''}`);
+      const s = sources[i];
+      let tag = '';
+      if (s.id === lastSuccessSourceId) tag = ' (首选: 上次成功)';
+      else if (s.isDefault) tag = ' (默认)';
+      info(`  ${i + 1}) [${s.id}] ${s.name}${tag}`);
     }
     const rl = createInterface({ input: process.stdin, output: process.stderr });
     try {
-      const defaultIdx = sources.findIndex((s) => s.id === defaultSource.id);
+      const defaultIdx = sources.findIndex((s) => s.id === activeFallback.id);
       const answer = (await rl.question(`请输入源序号 (1-${sources.length}) [${defaultIdx + 1}]: `)).trim();
       const idx = answer ? parseInt(answer, 10) - 1 : defaultIdx;
       if (Number.isInteger(idx) && idx >= 0 && idx < sources.length) {
         return sources[idx];
       }
-      return defaultSource;
+      return activeFallback;
     } finally {
       rl.close();
     }
   }
 
-  return defaultSource;
+  return activeFallback;
 }
 
 /**
@@ -400,13 +494,15 @@ export async function resolveModel(flags, modelList, sourceName = '') {
 
 /** 格式化输出所有配置的源（供 --sources 使用） */
 export function formatSourcesOutput(sourcesInfo, asJson = false) {
-  const { sources, configDesc } = sourcesInfo;
+  const { sources, configDesc, preferredSource, lastSuccessSourceId } = sourcesInfo;
   if (asJson) {
     const list = sources.map((s) => ({
       id: s.id,
       name: s.name,
       url: s.url || s.baseUrl,
       is_default: s.isDefault,
+      is_preferred: s.id === preferredSource?.id,
+      is_last_success: s.id === lastSuccessSourceId,
       has_key: Boolean(s.key),
       masked_key: maskKey(s.key),
       models: s.models,
@@ -418,18 +514,28 @@ export function formatSourcesOutput(sourcesInfo, asJson = false) {
   const lines = [];
   lines.push(`配置文件: ${configDesc}`);
   lines.push(`可用源数量: ${sources.length} 个`);
+  if (lastSuccessSourceId) {
+    lines.push(`首选源 (上次成功): [${lastSuccessSourceId}] ${preferredSource?.name || ''}`);
+  }
   lines.push('------------------------------------------------------------');
   for (let i = 0; i < sources.length; i++) {
     const s = sources[i];
-    const flag = s.isDefault ? '* ' : '  ';
-    lines.push(`${flag}${i + 1}. [${s.id}] ${s.name}${s.isDefault ? ' (默认源)' : ''}`);
+    const isPref = s.id === preferredSource?.id;
+    const flag = isPref ? '* ' : '  ';
+    let tag = '';
+    if (s.id === lastSuccessSourceId) {
+      tag = s.isDefault ? ' (首选: 上次成功, 默认源)' : ' (首选: 上次成功)';
+    } else if (s.isDefault) {
+      tag = ' (默认源)';
+    }
+    lines.push(`${flag}${i + 1}. [${s.id}] ${s.name}${tag}`);
     lines.push(`     服务地址: ${s.baseUrl}`);
     lines.push(`     访问凭证: ${s.key ? `已配置 (${maskKey(s.key)})` : '未配置 ✗'}`);
     lines.push(`     可用模型: ${s.models.join(', ')} (${s.models.length} 个)`);
     if (i < sources.length - 1) lines.push('');
   }
   lines.push('------------------------------------------------------------');
-  lines.push('提示: 带 * 的为默认源。可用 --source <id> 指定源，或通过 --model <name> 自动匹配对应源。');
+  lines.push('提示: 带 * 的为当前首选源。可用 --source <id> 指定源，或通过 --model <name> 自动匹配对应源。');
   return `${lines.join('\n')}\n`;
 }
 
@@ -994,12 +1100,14 @@ export async function doctor(flags) {
 
   for (let idx = 0; idx < targetSources.length; idx++) {
     const s = targetSources[idx];
-    const isMulti = targetSources.length > 1;
+    const tag = s.id === sourcesInfo.lastSuccessSourceId
+      ? (s.isDefault ? ' (首选: 上次成功, 默认源)' : ' (首选: 上次成功)')
+      : (s.isDefault ? ' (默认源)' : '');
     if (isMulti) {
       lines.push('');
-      lines.push(`==================== [${idx + 1}/${targetSources.length}] 源: [${s.id}] ${s.name}${s.isDefault ? ' (默认源)' : ''} ====================`);
+      lines.push(`==================== [${idx + 1}/${targetSources.length}] 源: [${s.id}] ${s.name}${tag} ====================`);
     } else {
-      lines.push(`源标识: [${s.id}] ${s.name}${s.isDefault ? ' (默认源)' : ''}`);
+      lines.push(`源标识: [${s.id}] ${s.name}${tag}`);
     }
 
     const baseUrl = flags.url ? apiRoot(flags.url) : s.baseUrl;

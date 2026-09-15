@@ -1,6 +1,7 @@
 {
-  "$comment": "多源配置示例：复制本文件为 config.json，并填入自己的真实凭据",
+  "$comment": "多源配置示例：复制本文件为 config.json，并填入自己的真实凭据。prefer_last_success 开启时自动将上次成功的源作为首选项",
   "default_source": "openai",
+  "prefer_last_success": true,
   "sources": [
     {
       "id": "openai",

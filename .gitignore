@@ -1,6 +1,7 @@
-# 凭据
+# 凭据与本地缓存
 config.json
 !config.json.example
+.cache.json
 
 # OS / IDE
 .DS_Store

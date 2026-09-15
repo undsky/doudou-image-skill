@@ -8,8 +8,8 @@ import { basename } from 'node:path';
 import {
   Fail, KNOWN_GOOD_SIZE, checkMask, checkPrompt, doctor, explain, fetchRemoteImage,
   formatModelsOutput, formatSourcesOutput, humanBytes, info, loadSources, parseArgs, parseCount,
-  parseImageData, parseSizeArg, parseTimeout, post, readImageFile, requireKey, resolveConfig,
-  resolveModel, run, safeStem, saveImages,
+  parseImageData, parseSizeArg, parseTimeout, post, readImageFile, recordLastSuccessSource, requireKey,
+  resolveConfig, resolveModel, run, safeStem, saveImages,
 } from './lib.mjs';
 
 const DEFAULT_TIMEOUT_MS = 300000;
@@ -159,6 +159,7 @@ async function main() {
 
   const stem = remote ? safeStem(prompt) : `${safeStem(basename(image.path).replace(/\.[a-z0-9]+$/i, ''), 16)}-edit`;
   const saved = await saveImages(images, flags, stem);
+  recordLastSuccessSource(config.source.id, flags.cacheDir);
   info(`完成：${saved.length} 张，源 [${config.source.id}]，模型 ${model}，耗时 ${seconds} 秒`);
 
   if (flags.json) {
