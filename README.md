@@ -65,7 +65,6 @@ npx skills add undsky/doudou-image-skill --yes
 
 ```json
 {
-  "default_source": "openai",
   "sources": [
     {
       "id": "openai",

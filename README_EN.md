@@ -77,7 +77,6 @@ Copy `config.json.example` in the skill root or project root to `config.json`, a
 
 ```json
 {
-  "default_source": "openai",
   "sources": [
     {
       "id": "openai",

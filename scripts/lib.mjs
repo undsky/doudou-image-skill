@@ -240,6 +240,7 @@ export function loadSources(flags = {}) {
   }
 
   let sources = [];
+  let defaultSourceId = '';
   const configDesc = `${basename(configFilePath)} (${configFilePath})`;
 
   try {
@@ -248,12 +249,12 @@ export function loadSources(flags = {}) {
     if (Array.isArray(parsed)) {
       sources = parsed.map((item, idx) => new ApiSource({
         ...item,
-        isDefault: Boolean(item.default || item.isDefault || idx === 0),
+        isDefault: Boolean(item.default || item.isDefault),
         configSource: `${basename(configFilePath)} [#${idx + 1}]`,
         keySource: `${basename(configFilePath)}`,
       }));
     } else if (parsed && typeof parsed === 'object') {
-      // prefer_last_success 始终启用，不再从配置读取
+      defaultSourceId = String(parsed.default_source || parsed.defaultSource || '').trim();
       const rawList = Array.isArray(parsed.sources)
         ? parsed.sources
         : (parsed.sources && typeof parsed.sources === 'object'
@@ -261,7 +262,9 @@ export function loadSources(flags = {}) {
             : []);
       sources = rawList.map((item, idx) => new ApiSource({
         ...item,
-        isDefault: Boolean(item.default || item.isDefault || idx === 0),
+        isDefault: defaultSourceId
+          ? item.id === defaultSourceId
+          : Boolean(item.default || item.isDefault),
         configSource: `${basename(configFilePath)} [${item.id || idx + 1}]`,
         keySource: `${basename(configFilePath)}`,
       }));
@@ -278,9 +281,18 @@ export function loadSources(flags = {}) {
     );
   }
 
-  // 确保至少有且仅有一个 isDefault
-  const defaultIdx = sources.findIndex((s) => s.isDefault);
-  if (defaultIdx === -1 && sources.length > 0) {
+  // 确保有且仅有一个 isDefault：若未配置或配置了无效 default_source 则默认第 1 项为默认源
+  let hasDefault = false;
+  for (const s of sources) {
+    if (s.isDefault) {
+      if (hasDefault) {
+        s.isDefault = false;
+      } else {
+        hasDefault = true;
+      }
+    }
+  }
+  if (!hasDefault && sources.length > 0) {
     sources[0].isDefault = true;
   }
 
@@ -874,8 +886,9 @@ function targetPaths(images, flags, stem) {
     try { return statSync(out).isDirectory(); } catch { return false; }
   })();
   if (asDir) {
+    const dir = resolve(out);
     const stamp = timestamp();
-    return images.map((_, i) => join(out, `${stem}-${stamp}${images.length > 1 ? `-${i + 1}` : ''}${ext(i)}`));
+    return images.map((_, i) => join(dir, `${stem}-${stamp}${images.length > 1 ? `-${i + 1}` : ''}${ext(i)}`));
   }
   // 单文件：原样用用户给的路径（扩展名不改，只在对不上时警告）
   if (images.length === 1) return [resolve(out)];
@@ -991,7 +1004,11 @@ export async function fetchRemoteImage(url) {
   let filename = 'remote-image.png';
   try {
     const u = new URL(url);
-    filename = basename(u.pathname) || 'remote-image.png';
+    const base = basename(u.pathname);
+    if (base) {
+      const ext = extname(base);
+      filename = ext ? base : `${base}${EXT_OF[mime] || '.png'}`;
+    }
   } catch { /* ignore */ }
   return { path: url, buffer, mime, bytes: buffer.length, filename };
 }
