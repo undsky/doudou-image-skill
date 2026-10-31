@@ -1,6 +1,6 @@
 # 凭据与本地缓存
-config.json
-!config.json.example
+doudou.image.config.json
+!doudou.image.config.json.example
 .cache.json
 
 # OS / IDE

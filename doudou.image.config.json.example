@@ -1,5 +1,5 @@
 {
-  "$comment": "多源配置示例：复制本文件为 config.json，并填入自己的真实凭据",
+  "$comment": "多源配置示例：复制本文件为 doudou.image.config.json，并填入自己的真实凭据",
   "sources": [
     {
       "id": "openai",

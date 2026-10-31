@@ -82,12 +82,12 @@ export class Fail extends Error {
   }
 }
 
-export const CONFIG_FILE_NAME = 'config.json';
+export const CONFIG_FILE_NAME = 'doudou.image.config.json';
 
-/** config.json 向上查找的层级数（含起始目录自身） */
+/** doudou.image.config.json 向上查找的层级数（含起始目录自身） */
 export const CONFIG_LOOKUP_LEVELS = 4;
 
-/** 从 startDir 起向上收集存在的 config.json 路径（由近到远） */
+/** 从 startDir 起向上收集存在的 doudou.image.config.json 路径（由近到远） */
 function collectConfigChain(startDir) {
   const chain = [];
   let curr = resolve(startDir);
@@ -102,13 +102,13 @@ function collectConfigChain(startDir) {
 }
 
 /**
- * 查找配置文件 config.json：
+ * 查找配置文件 doudou.image.config.json：
  * 1. 显式指定的 customPath 优先（先相对 cwd，再相对技能目录）；
- * 2. 项目工作目录链上第一个非技能自带的 config.json（项目级配置优先于技能默认配置）；
+ * 2. 项目工作目录链上第一个非技能自带的 doudou.image.config.json（项目级配置优先于技能默认配置）；
  * 3. 技能目录自身，再沿技能目录向上（兼容挂载在 <project>/.agents/skills/ 等场景）。
  *
  * 不用 ROOT_MARKERS 提前 break：技能目录自身通常就是个 git 仓库（带 .git），
- * 一判就中、循环第一轮就退出，父级的 config.json 永远轮不到检查。
+ * 一判就中、循环第一轮就退出，父级的 doudou.image.config.json 永远轮不到检查。
  * 边界改由 CONFIG_LOOKUP_LEVELS 控制，与 doudou-cdn-skill 的 .env 查找口径一致。
  */
 export function findConfigFile(customPath) {
@@ -224,7 +224,7 @@ export class ApiSource {
 }
 
 /**
- * 加载所有配置的源：从 config.json 加载。
+ * 加载所有配置的源：从 doudou.image.config.json 加载。
  * 找不到配置文件时抛出 Fail 错误，提示用户创建。
  */
 export function loadSources(flags = {}) {
@@ -233,9 +233,9 @@ export function loadSources(flags = {}) {
 
   if (!configFilePath) {
     throw new Fail(
-      '未找到图像配置文件 config.json',
-      `请复制技能目录下的 config.json.example 为 config.json，并配置 API 地址、访问凭证（Key）与模型列表。\n`
-      + `参考命令：cp ${join(SKILL_DIR, 'config.json.example')} ${join(SKILL_DIR, 'config.json')}`,
+      `未找到图像配置文件 ${CONFIG_FILE_NAME}`,
+      `请复制技能目录下的 ${CONFIG_FILE_NAME}.example 为 ${CONFIG_FILE_NAME}，并配置 API 地址、访问凭证（Key）与模型列表。\n`
+      + `参考命令：cp ${join(SKILL_DIR, `${CONFIG_FILE_NAME}.example`)} ${join(SKILL_DIR, CONFIG_FILE_NAME)}`,
     );
   }
 
@@ -277,7 +277,7 @@ export function loadSources(flags = {}) {
   if (sources.length === 0) {
     throw new Fail(
       `配置文件 ${basename(configFilePath)} 中未定义任何有效源`,
-      '请参考 config.json.example 在 sources 数组中添加至少一个配置项',
+      `请参考 ${CONFIG_FILE_NAME}.example 在 sources 数组中添加至少一个配置项`,
     );
   }
 
@@ -1148,7 +1148,7 @@ export function requireKey(config) {
   if (config.key) return;
   throw new Fail(
     `当前源 [${config.source?.id || 'default'}] 未配置 API 访问凭证（Key）`,
-    `请在配置文件 ${basename(config.configFile || 'config.json')} 中为 [${config.source?.id || 'default'}] 填入 key，或在命令行使用 --key <token> 传递。`,
+    `请在配置文件 ${basename(config.configFile || CONFIG_FILE_NAME)} 中为 [${config.source?.id || 'default'}] 填入 key，或在命令行使用 --key <token> 传递。`,
   );
 }
 
